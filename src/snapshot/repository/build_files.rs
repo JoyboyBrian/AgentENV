@@ -100,7 +100,8 @@ pub trait TemplateBuildFileStore: Send + Sync {
     ///
     /// Verification never removes the grant, so a request that fails before
     /// the archive is stored can be retried with the same upload URL. Callers
-    /// must still `claim_upload_grant` before publishing the archive.
+    /// must `claim_upload_grant` after publishing the archive, so a failed
+    /// publication leaves the URL retryable.
     async fn verify_upload_grant(
         &self,
         token: &str,
@@ -120,8 +121,10 @@ pub trait TemplateBuildFileStore: Send + Sync {
     /// concurrent requests carrying the same token cannot both succeed.
     /// S3-compatible backends have no conditional delete and therefore
     /// degrade to best-effort single-use within the grant TTL; archive
-    /// immutability is what keeps a lost race from mattering, since the
-    /// competing uploads can only publish the same content-addressed archive.
+    /// immutability is what keeps a lost race from mattering: both uploads are
+    /// bound to the same (template_id, hash), and `import` is first-write-wins,
+    /// so neither can change an archive that is already stored — which upload
+    /// wins a first store is undefined.
     async fn claim_upload_grant(
         &self,
         token: &str,

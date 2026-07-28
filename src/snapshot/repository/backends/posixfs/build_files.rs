@@ -58,7 +58,8 @@ impl PosixFsTemplateBuildFileStore {
     }
 
     /// Removes archives whose modification time is older than the retention
-    /// window. Runs opportunistically on import; failures only log.
+    /// window. Runs opportunistically on import and scans a bounded number of
+    /// entries per call; failures only log.
     fn prune_expired(root: &Path) {
         let cutoff = SystemTime::now() - BUILD_FILE_RETENTION;
         Self::prune_dir_older_than(root, "tar", cutoff);
@@ -66,7 +67,9 @@ impl PosixFsTemplateBuildFileStore {
 
     /// Removes upload grants that have passed their own `expires_unix`. Runs
     /// opportunistically whenever a new grant is written, so the grants
-    /// directory stays bounded by upload-link traffic; failures only log.
+    /// directory stays bounded by upload-link traffic; the scan is bounded per
+    /// call and drains the backlog over successive requests, and failures only
+    /// log.
     ///
     /// Pruning by the record rather than by mtime keeps grants alive for
     /// exactly their TTL even when `template_build.files_url_ttl_secs` is
@@ -92,19 +95,30 @@ impl PosixFsTemplateBuildFileStore {
         });
     }
 
+    /// Pruning is opportunistic and bounded: at most `MAX_PRUNE_SCAN` matching
+    /// entries are inspected per call, so the cost a request pays stays
+    /// constant no matter how many records the directory holds. Anything left
+    /// over is reclaimed by later calls.
     fn prune_dir(
         dir: &Path,
         extension: &str,
         is_expired: impl Fn(&Path, Option<SystemTime>) -> bool,
     ) {
+        const MAX_PRUNE_SCAN: usize = 256;
+
         let Ok(entries) = fs::read_dir(dir) else {
             return;
         };
+        let mut scanned: usize = 0;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_none_or(|ext| ext != extension) {
                 continue;
             }
+            if scanned >= MAX_PRUNE_SCAN {
+                break;
+            }
+            scanned += 1;
             let modified = entry
                 .metadata()
                 .and_then(|metadata| metadata.modified())
@@ -248,6 +262,16 @@ impl TemplateBuildFileStore for PosixFsTemplateBuildFileStore {
                 let _ = fs::remove_file(&store_staged);
                 RepositoryError::backend("copy build archive into store", error)
             })?;
+            // The archive is only ever published once, so its data must reach
+            // stable storage before the name does: a directory entry that
+            // outlives the bytes would pin a truncated archive forever behind
+            // the `exists` fast path.
+            fs::File::open(&store_staged)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| {
+                    let _ = fs::remove_file(&store_staged);
+                    RepositoryError::backend("sync build archive", error)
+                })?;
             // Link rather than rename so a concurrent import cannot replace an
             // archive a running build is already reading: the first writer
             // wins and everyone else observes `AlreadyExists`.
@@ -256,6 +280,17 @@ impl TemplateBuildFileStore for PosixFsTemplateBuildFileStore {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
                 Err(error) => Err(RepositoryError::backend("publish build archive", error)),
             };
+            if published.is_ok() {
+                // Best effort: filesystems that reject a directory fsync must
+                // keep working, and a lost entry only costs one re-upload.
+                if let Err(error) = fs::File::open(&root).and_then(|dir| dir.sync_all()) {
+                    debug!(
+                        path = %root.display(),
+                        error = %error,
+                        "failed to sync build archive store directory"
+                    );
+                }
+            }
             let _ = fs::remove_file(&store_staged);
             published
         })

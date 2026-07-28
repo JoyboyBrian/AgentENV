@@ -329,14 +329,22 @@ impl SourceArchive {
             Ok(2) => magic == [0x1f, 0x8b],
             _ => false,
         };
+        // Every indexed entry charges at least its own 512-byte header against
+        // the payload budget, so the configured limit already bounds how many
+        // entries an archive can hold.
+        let max_entries = (max_total_bytes / 512 + 1).min(MAX_ARCHIVE_ENTRIES as u64);
         Ok(Self {
             file,
             gzip,
             // The tar crate buffers GNU long-name and PAX records whole before
             // any per-entry budget check can run, so the reader itself has to
-            // be capped. The slack covers per-entry framing for the maximum
-            // entry count on top of the caller's payload budget.
-            budget: max_total_bytes.saturating_add(MAX_ARCHIVE_ENTRIES as u64 * 1024),
+            // be capped. The slack allows 1 KiB of framing for every entry the
+            // budget can hold plus the end-of-archive terminator, which keeps
+            // long-name-heavy archives acceptable while keeping the raw stream
+            // proportional to the caller's payload budget at any setting.
+            budget: max_total_bytes
+                .saturating_add(max_entries.saturating_mul(1024))
+                .saturating_add(1024),
         })
     }
 
@@ -455,15 +463,20 @@ fn map_entries(
     let dest = resolve_guest_path(workdir, if dest_raw.is_empty() { "." } else { dest_raw })?;
 
     let copy_whole_context = src.is_empty() || src == ".";
+    // Docker gives a wildcard that resolves to exactly one regular file the
+    // same destination semantics as a literal single-file source. A matched
+    // directory always contributes its own member, so `!is_dir` is what keeps
+    // directory sources on the recursive path.
     let single_file_src = !copy_whole_context
-        && !is_glob_pattern(&src)
         && index.len() == 1
-        && index[0].path == src
-        && !index[0].is_dir;
+        && !index[0].is_dir
+        && (index[0].path == src || glob_match(&src, &index[0].path));
 
     let mapped: Vec<String> = if single_file_src {
         vec![if dest_is_dir_hint {
-            join_abs(&dest, base_name(&src))
+            // The base name has to come from the resolved entry: the source
+            // may be a pattern, which is never a valid path component.
+            join_abs(&dest, base_name(&index[0].path))
         } else {
             dest.clone()
         }]
@@ -552,7 +565,10 @@ fn map_entries(
         targets,
         dest_root: dest,
         skipped_dest_root,
-        dest_is_dir: !single_file_src,
+        // An explicit directory destination ("dest/") is a directory even for
+        // a single-file copy, and the guest still has to create it when it is
+        // missing: no archive member covers the destination root itself.
+        dest_is_dir: !single_file_src || dest_is_dir_hint,
     })
 }
 
@@ -780,9 +796,14 @@ mod tests {
         let tar = build_source_tar(dir.path(), &[("requirements.txt", Some("e2b\n"))]);
         let out = dir.path().join("out.tar");
 
-        plan_copy_archive(&request(&tar, "requirements.txt", "/home/user/", "/"), &out)
+        let plan = plan_copy_archive(&request(&tar, "requirements.txt", "/home/user/", "/"), &out)
             .expect("plan");
 
+        assert_eq!(plan.dest_root, "/home/user");
+        assert!(
+            plan.dest_is_dir,
+            "an explicit directory destination must be prepared by the guest"
+        );
         assert!(rewritten_entries(&out).contains_key("home/user/requirements.txt"));
     }
 
@@ -865,6 +886,34 @@ mod tests {
         let entries = rewritten_entries(&out);
         assert!(entries.contains_key("data/one.txt"));
         assert!(entries.contains_key("data/two.txt"));
+    }
+
+    #[test]
+    fn glob_matching_one_file_renames_onto_a_file_dest() {
+        let dir = TempDir::new().expect("tempdir");
+        let tar = build_source_tar(dir.path(), &[("one.txt", Some("1"))]);
+        let out = dir.path().join("out.tar");
+
+        let plan =
+            plan_copy_archive(&request(&tar, "*.txt", "/renamed.txt", "/"), &out).expect("plan");
+
+        assert!(
+            !plan.dest_is_dir,
+            "a wildcard resolving to one file renames like a literal source"
+        );
+        assert!(rewritten_entries(&out).contains_key("renamed.txt"));
+    }
+
+    #[test]
+    fn glob_matching_one_file_keeps_its_name_under_a_directory_dest() {
+        let dir = TempDir::new().expect("tempdir");
+        let tar = build_source_tar(dir.path(), &[("one.txt", Some("1"))]);
+        let out = dir.path().join("out.tar");
+
+        plan_copy_archive(&request(&tar, "*.txt", "/data/", "/"), &out).expect("plan");
+
+        // The base name comes from the matched entry, never from the pattern.
+        assert!(rewritten_entries(&out).contains_key("data/one.txt"));
     }
 
     #[test]
@@ -968,7 +1017,9 @@ mod tests {
         // A GNU long-name record declaring far more bytes than it carries.
         // The tar crate buffers such a record whole; the capped reader bounds
         // that allocation and the overdeclared record fails as truncated
-        // instead of being served the rest of the stream as name bytes.
+        // instead of being served the rest of the stream as name bytes. The
+        // cap scales with the configured budget, so the 64 KiB limit below
+        // bounds the allocation at KiB rather than MiB scale.
         let mut header = tar::Header::new_gnu();
         let long_link = b"././@LongLink";
         header.as_gnu_mut().expect("gnu header").name[..long_link.len()].copy_from_slice(long_link);

@@ -110,7 +110,7 @@ impl EnvdInstance {
                 debug!(%error, "ignoring envd upload response-body decoding error");
                 Ok(())
             }
-            Err(error) => Err(anyhow!("upload file to sandbox via envd: {error}")),
+            Err(error) => Err(anyhow::Error::new(error).context("upload file to sandbox via envd")),
         }
     }
 

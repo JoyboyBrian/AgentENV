@@ -235,10 +235,11 @@ impl TemplateStepExecutor {
 
         // The plan never emits a header for the destination root, so a
         // pre-existing destination keeps its metadata. Create it here when it
-        // is missing so a fresh destination still gets the requested metadata;
-        // `tar -C /` auto-creates any missing intermediate directory. File-only
-        // archives carry no directory member for the root, hence the
-        // `dest_is_dir` gate rather than `skipped_dest_root` alone.
+        // is missing so a fresh destination still gets the requested
+        // ownership; `tar -C /` auto-creates any missing intermediate
+        // directory. File-only archives carry no directory member for the
+        // root, hence the `dest_is_dir` gate rather than `skipped_dest_root`
+        // alone.
         let mut script = String::new();
         if plan.skipped_dest_root || plan.dest_is_dir {
             let dest_root = shell_quote(&plan.dest_root);
@@ -250,7 +251,12 @@ impl TemplateStepExecutor {
                     owner.uid, owner.gid
                 ));
             }
-            if let Some(mode) = mode {
+            // `--chmod` applies to copied content only. `skipped_dest_root`
+            // means the archive itself carried the destination directory, so
+            // the mode is the one that entry would have received; a directory
+            // synthesized for a single-file copy is not copied content and
+            // must not take the file's mode.
+            if let Some(mode) = mode.filter(|_| plan.skipped_dest_root) {
                 script.push_str(&format!("  chmod {mode:o} -- {dest_root} || exit 1\n"));
             }
             script.push_str("fi\n");
@@ -281,9 +287,9 @@ impl TemplateStepExecutor {
     /// Resolves a `--chown` spec to numeric ids inside the build sandbox.
     ///
     /// Docker resolves names against the image's own `/etc/passwd` and
-    /// `/etc/group`, so the lookup has to happen in the guest. Failing here
-    /// reports an unknown user the same way Docker does rather than silently
-    /// falling back to root.
+    /// `/etc/group`, so the lookup has to happen in the guest. A failed lookup
+    /// fails the step the way Docker does rather than silently falling back to
+    /// root.
     async fn resolve_ownership(
         &self,
         sandbox: &impl SandboxExecutor,
@@ -321,9 +327,13 @@ printf '%s %s\n' "$uid" "$gid"
                 )
             })?;
         if output.exit_code != 0 {
+            // A nonzero exit also covers a missing group, a `/etc/group` the
+            // lookup cannot read, and a guest without `id`/`awk`, so the
+            // message must not assert that the user is absent.
             return Err(TemplateBuildFailure::with_step(
                 format!(
-                    "build step failed: COPY user '{user}' does not exist in the image{}",
+                    "build step failed: could not resolve COPY ownership '{user}' in the image; \
+                     the user or group may not exist{}",
                     command_output_suffix(&output.stdout, &output.stderr)
                 ),
                 step_label,
@@ -426,10 +436,14 @@ mod tests {
     /// One recorded exec: command, arguments, and working directory.
     type RecordedCommand = (String, Vec<String>, Option<String>);
 
-    /// Records every command a step issues and reports success.
+    /// Records every command a step issues and replays a canned result.
     #[derive(Default)]
     struct RecordingSandbox {
         commands: Mutex<Vec<RecordedCommand>>,
+        /// Stdout every recorded command reports back.
+        stdout: String,
+        /// Exit code every recorded command reports back.
+        exit_code: i32,
     }
 
     impl RecordingSandbox {
@@ -461,9 +475,9 @@ mod tests {
                     opts.cwd.clone(),
                 ));
             Ok(ProcessOutput {
-                stdout: String::new(),
+                stdout: self.stdout.clone(),
                 stderr: String::new(),
-                exit_code: 0,
+                exit_code: self.exit_code,
             })
         }
         async fn start_process(
@@ -474,6 +488,31 @@ mod tests {
         ) -> Result<ProcessHandle> {
             Err(anyhow!("not used by this test"))
         }
+        async fn upload_file(
+            &self,
+            _local_path: &std::path::Path,
+            _guest_path: &str,
+            _username: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Writes a one-file build context archive and returns its path.
+    fn single_file_archive(dir: &std::path::Path) -> std::path::PathBuf {
+        let tar_path = dir.join("context.tar");
+        let mut builder =
+            tar::Builder::new(std::fs::File::create(&tar_path).expect("create context tar"));
+        let contents = b"e2b\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(contents.len() as u64);
+        builder
+            .append_data(&mut header, "requirements.txt", &contents[..])
+            .expect("append file");
+        builder.finish().expect("finish context tar");
+        tar_path
     }
 
     async fn run(steps: Vec<TemplateBuildStep>) -> CommandContext {
@@ -553,6 +592,75 @@ mod tests {
             .await
             .expect_err("missing archive should fail the step");
         assert!(err.to_string().contains("has not been uploaded"));
+    }
+
+    #[tokio::test]
+    async fn copy_step_prepares_a_directory_dest_without_chmod() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut archives = HashMap::new();
+        archives.insert(
+            "aabbccddeeff0011".to_string(),
+            single_file_archive(dir.path()),
+        );
+        let sandbox = RecordingSandbox {
+            stdout: "1000 2000\n".to_string(),
+            ..RecordingSandbox::default()
+        };
+
+        TemplateStepExecutor::new()
+            .execute(
+                &sandbox,
+                &[TemplateBuildStep::copy(
+                    "requirements.txt",
+                    "/home/user/",
+                    "aabbccddeeff0011",
+                    Some("1000:2000".to_string()),
+                    Some(0o600),
+                )],
+                CommandContext::default(),
+                &archives,
+            )
+            .await
+            .expect("copy step should execute");
+
+        let commands = sandbox.commands();
+        let script = &commands.last().expect("extraction command").1[1];
+        let dest_root = shell_quote("/home/user");
+        assert!(
+            script.contains(&format!("mkdir -p -- {dest_root}")),
+            "a missing directory destination must be created: {script}"
+        );
+        assert!(
+            script.contains(&format!("chown 1000:2000 -- {dest_root}")),
+            "a created destination must carry the requested ownership: {script}"
+        );
+        assert!(
+            !script.contains("chmod"),
+            "--chmod applies to copied content, not to a synthesized destination: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_ownership_lookup_does_not_claim_the_user_is_absent() {
+        let sandbox = RecordingSandbox {
+            exit_code: 1,
+            ..RecordingSandbox::default()
+        };
+
+        let err = TemplateStepExecutor::new()
+            .resolve_ownership(&sandbox, "root:missing-group", "COPY a b")
+            .await
+            .expect_err("a failed ownership lookup must fail the step");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("could not resolve COPY ownership 'root:missing-group'"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            !message.contains("does not exist"),
+            "the same exit also covers a missing group or an unusable lookup: {message}"
+        );
     }
 
     #[test]
