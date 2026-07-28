@@ -120,7 +120,7 @@ How `COPY` works: for each `COPY` instruction the SDK requests an upload link (`
 Requirements and behavior notes:
 
 - The base image must provide `/bin/bash` (already required for `RUN` steps) and `tar` for `COPY` steps.
-- Copied files are owned by `root:root` like Docker's `COPY` default; `COPY --chown=user:group` is applied with `chown -R` after extraction, so the user must exist in the image.
+- Copied files are owned by `root:root` like Docker's `COPY` default. `COPY --chown=user:group` resolves names against the image's own `/etc/passwd` and `/etc/group` and applies only to the files the copy creates; an unknown user fails the build.
 - Write directory destinations with a trailing slash (`COPY app.py /opt/`). Docker's special case of copying a single file onto an existing directory named without a trailing slash (`COPY app.py /opt`) is not supported and fails the build with a clear error.
 - Rebuilding an existing alias is allowed: the alias keeps pointing at the previous template while the new build runs and moves to the new template when the build commits (E2B semantics). The previous template stays addressable by ID. A failed rebuild leaves the alias untouched.
 

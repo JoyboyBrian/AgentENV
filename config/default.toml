@@ -84,6 +84,8 @@ peer_discovery_refresh_interval_secs = 5
 # (GET /templates/{templateID}/files/{hash} plus the returned upload URL).
 # Maximum accepted size for one uploaded build-context archive, in MiB.
 # files_max_upload_mib = 1024
+# Maximum size one build-context archive may expand to once decompressed, in MiB.
+# files_max_context_mib = 4096
 # How long an issued upload URL stays valid, in seconds.
 # files_url_ttl_secs = 3600
 # Optional external base URL used when building upload URLs. Defaults to
