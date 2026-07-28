@@ -7,11 +7,13 @@ use tokio::task;
 
 use super::super::shared_runtime_cache_root;
 use super::artifacts::{CollectedBuiltArtifacts, PosixFsArtifactStore};
+use super::build_files::PosixFsTemplateBuildFileStore;
 use super::catalog::PosixFsCatalogStore;
 use super::runtime::PosixFsRuntimeResolver;
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
+use crate::snapshot::repository::build_files::TemplateBuildFileStore;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 use crate::snapshot::repository::{RepositoryError, RepositoryResult, SnapshotListFilter};
 use crate::snapshot::types::{
@@ -72,9 +74,11 @@ impl PosixFsBackend {
         let runtime_cache_root = runtime_cache_root.unwrap_or_else(|| cache_root.join("runtime"));
         let catalog_store = Arc::new(PosixFsCatalogStore::new(root.clone()));
         let artifact_store = Arc::new(PosixFsArtifactStore::new(root.clone()));
+        let build_files = PosixFsTemplateBuildFileStore::new(&root);
         let repository: Arc<dyn SnapshotRepository> = Arc::new(PosixFsSnapshotRepository::new(
             catalog_store,
             artifact_store,
+            build_files,
         ));
         let runtime_resolver: Arc<dyn SnapshotRuntimeResolver> = Arc::new(
             PosixFsRuntimeResolver::new(root, runtime_cache_root, store, cache),
@@ -111,16 +115,19 @@ impl PosixFsBackend {
 pub(crate) struct PosixFsSnapshotRepository {
     catalog_store: Arc<PosixFsCatalogStore>,
     artifact_store: Arc<PosixFsArtifactStore>,
+    build_files: Arc<PosixFsTemplateBuildFileStore>,
 }
 
 impl PosixFsSnapshotRepository {
     pub(crate) fn new(
         catalog_store: Arc<PosixFsCatalogStore>,
         artifact_store: Arc<PosixFsArtifactStore>,
+        build_files: Arc<PosixFsTemplateBuildFileStore>,
     ) -> Self {
         Self {
             catalog_store,
             artifact_store,
+            build_files,
         }
     }
 
@@ -235,6 +242,10 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
             repository.create_sync(record)
         })
         .await
+    }
+
+    fn template_build_files(&self) -> Option<Arc<dyn TemplateBuildFileStore>> {
+        Some(Arc::clone(&self.build_files) as Arc<dyn TemplateBuildFileStore>)
     }
 
     async fn publish(
@@ -399,6 +410,7 @@ mod tests {
         PosixFsSnapshotRepository::new(
             Arc::new(PosixFsCatalogStore::new(root.to_path_buf())),
             Arc::new(PosixFsArtifactStore::new(root.to_path_buf())),
+            super::super::build_files::PosixFsTemplateBuildFileStore::new(root),
         )
     }
 
@@ -474,37 +486,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_commit_cleans_uncommitted_snapshot_directory() {
+    async fn publish_rebinds_existing_alias_to_new_snapshot() {
         let tempdir = TempDir::new().expect("tempdir should exist");
-        let repository_root = tempdir.path().to_path_buf();
         let repository = test_backend(tempdir.path()).repository();
 
         let first_id = SnapshotId::generate();
         let local_artifacts = seed_built_snapshot(tempdir.path());
-        let first_metadata = sample_metadata(first_id.clone(), Some("conflict"));
         repository
-            .publish(first_metadata, local_artifacts)
+            .publish(
+                sample_metadata(first_id.clone(), Some("rebind")),
+                local_artifacts,
+            )
             .await
             .expect("first publish should work");
 
         let second_id = SnapshotId::generate();
         let local_artifacts = seed_built_snapshot(tempdir.path());
-        let err = repository
+        repository
             .publish(
-                sample_metadata(second_id.clone(), Some("conflict")),
+                sample_metadata(second_id.clone(), Some("rebind")),
                 local_artifacts,
             )
             .await
-            .expect_err("second publish should fail");
+            .expect("second publish should rebind the alias");
 
-        assert!(matches!(err, RepositoryError::AliasConflict { .. }));
-        assert!(
-            !repository_root
-                .join("snapshots")
-                .join(second_id.to_string())
-                .exists(),
-            "failed publish should not leave a committed revision directory"
+        let resolved = repository
+            .resolve_alias("rebind")
+            .await
+            .expect("resolve should work")
+            .expect("alias should resolve");
+        assert_eq!(resolved, second_id, "alias should move to the new snapshot");
+
+        let previous = repository
+            .get(first_id.to_string().as_str())
+            .await
+            .expect("get should work")
+            .expect("previous snapshot should stay addressable by id");
+        assert_eq!(
+            previous.alias, None,
+            "previous snapshot should lose the rebound alias"
         );
+    }
+
+    #[tokio::test]
+    async fn create_keeps_existing_alias_until_new_build_commits() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let repository = test_backend(tempdir.path()).repository();
+
+        let committed_id = SnapshotId::generate();
+        let local_artifacts = seed_built_snapshot(tempdir.path());
+        repository
+            .publish(
+                sample_metadata(committed_id.clone(), Some("stable")),
+                local_artifacts,
+            )
+            .await
+            .expect("publish should work");
+
+        let waiting = SnapshotRecord::template_waiting(
+            SnapshotId::generate(),
+            Some(SnapshotAlias::parse("stable").expect("alias should parse")),
+            crate::types::SandboxResources {
+                cpu_count: 1,
+                memory_mib: 256,
+                disk_size_mib: 0,
+            },
+        );
+        let waiting_id = waiting.id.clone();
+        repository
+            .create(waiting)
+            .await
+            .expect("create with an existing alias should be allowed");
+
+        let resolved = repository
+            .resolve_alias("stable")
+            .await
+            .expect("resolve should work")
+            .expect("alias should resolve");
+        assert_eq!(
+            resolved, committed_id,
+            "alias should keep pointing at the committed snapshot while the rebuild is pending"
+        );
+
+        let local_artifacts = seed_built_snapshot(tempdir.path());
+        repository
+            .publish(
+                sample_metadata(waiting_id.clone(), Some("stable")),
+                local_artifacts,
+            )
+            .await
+            .expect("publishing the rebuild should rebind the alias");
+
+        let resolved = repository
+            .resolve_alias("stable")
+            .await
+            .expect("resolve should work")
+            .expect("alias should resolve");
+        assert_eq!(resolved, waiting_id, "alias should move after commit");
     }
 
     #[tokio::test]
