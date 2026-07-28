@@ -66,8 +66,10 @@ pub trait TemplateBuildFileStore: Send + Sync {
     /// Imports a fully written local file as the archive for `hash`.
     ///
     /// Implementations must publish atomically: concurrent readers never
-    /// observe a partially imported archive. Re-importing an existing hash
-    /// replaces the stored archive.
+    /// observe a partially imported archive. Archives are content-addressed
+    /// and therefore immutable — importing a hash that is already stored
+    /// keeps the stored archive, so an in-flight build can never observe its
+    /// build context change underneath it.
     async fn import(&self, hash: &str, staged: &Path) -> RepositoryResult<()>;
 
     /// Materializes the archive for `hash` as a node-local file.
@@ -91,8 +93,14 @@ pub trait TemplateBuildFileStore: Send + Sync {
         expires_unix: i64,
     ) -> RepositoryResult<String>;
 
-    /// Returns whether a durable bearer grant authorizes this upload.
-    async fn validate_upload_grant(
+    /// Claims a durable bearer grant, returning whether it authorized this
+    /// upload.
+    ///
+    /// Grants are single-use: a successful claim consumes the grant, so an
+    /// upload URL cannot be replayed within its TTL. Implementations must
+    /// make the claim itself the atomic step, so concurrent requests carrying
+    /// the same token cannot both succeed.
+    async fn claim_upload_grant(
         &self,
         token: &str,
         template_id: &str,

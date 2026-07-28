@@ -92,14 +92,15 @@ where
         );
     };
 
+    // Claiming consumes the grant, so an upload URL works exactly once.
     let now_unix = chrono::Utc::now().timestamp();
     let authorized = match store
-        .validate_upload_grant(&query.token, &template_id, &hash, query.expires, now_unix)
+        .claim_upload_grant(&query.token, &template_id, &hash, query.expires, now_unix)
         .await
     {
         Ok(authorized) => authorized,
         Err(error) => {
-            warn!(error = %error, "failed to validate build-file upload grant");
+            warn!(error = %error, "failed to claim build-file upload grant");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to validate upload grant",
@@ -109,7 +110,7 @@ where
     if !authorized {
         return error_response(
             StatusCode::UNAUTHORIZED,
-            "upload grant is invalid or expired; request a fresh upload link",
+            "upload grant is invalid, expired, or already used; request a fresh upload link",
         );
     }
 

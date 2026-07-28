@@ -171,6 +171,11 @@ impl TemplateBuildFileStore for PosixFsTemplateBuildFileStore {
         let root = self.root.clone();
         let staged = staged.to_path_buf();
         task::spawn_blocking(move || -> RepositoryResult<()> {
+            // Archives are immutable: the hash addresses the content, so a
+            // repeat upload cannot change what an in-flight build reads.
+            if final_path.exists() {
+                return Ok(());
+            }
             Self::ensure_root(&root)?;
             Self::prune_expired(&root);
             // Copy into the store filesystem first (the staged file usually
@@ -215,7 +220,7 @@ impl TemplateBuildFileStore for PosixFsTemplateBuildFileStore {
             .map_err(|error| RepositoryError::backend("join create upload grant task", error))?
     }
 
-    async fn validate_upload_grant(
+    async fn claim_upload_grant(
         &self,
         token: &str,
         template_id: &str,
@@ -238,10 +243,20 @@ impl TemplateBuildFileStore for PosixFsTemplateBuildFileStore {
             };
             let grant: TemplateBuildUploadGrant = serde_json::from_slice(&bytes)
                 .map_err(|error| RepositoryError::backend("parse upload grant", error))?;
-            Ok(grant.authorizes(&template_id, &hash, expires_unix, now_unix))
+            if !grant.authorizes(&template_id, &hash, expires_unix, now_unix) {
+                return Ok(false);
+            }
+            // Consume the grant. `remove_file` succeeds for exactly one
+            // caller, so it is the claim: concurrent replays of the same
+            // token lose the race and are rejected.
+            match fs::remove_file(&path) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(RepositoryError::backend("consume upload grant", error)),
+            }
         })
         .await
-        .map_err(|error| RepositoryError::backend("join validate upload grant task", error))?
+        .map_err(|error| RepositoryError::backend("join claim upload grant task", error))?
     }
 }
 
@@ -338,7 +353,7 @@ mod tests {
         assert!(!stale_path.exists(), "expired grant file should be pruned");
         assert!(
             store
-                .validate_upload_grant(&fresh_token, "template", HASH, i64::MAX, 0)
+                .claim_upload_grant(&fresh_token, "template", HASH, i64::MAX, 0)
                 .await
                 .expect("validation should work"),
             "unexpired grants must survive pruning"
@@ -349,22 +364,73 @@ mod tests {
     async fn upload_grant_is_shared_across_instances() {
         let tempdir = TempDir::new().expect("tempdir");
         let first = PosixFsTemplateBuildFileStore::new(tempdir.path());
+        let second = PosixFsTemplateBuildFileStore::new(tempdir.path());
+
+        // A mismatched or expired claim leaves the grant usable.
         let token = first
             .create_upload_grant("template", HASH, 1000)
             .await
             .expect("grant should be created");
-        let second = PosixFsTemplateBuildFileStore::new(tempdir.path());
-        assert!(second
-            .validate_upload_grant(&token, "template", HASH, 1000, 999)
-            .await
-            .expect("grant should validate"));
         assert!(!second
-            .validate_upload_grant(&token, "other", HASH, 1000, 999)
+            .claim_upload_grant(&token, "other", HASH, 1000, 999)
             .await
             .expect("mismatched grant should be rejected"));
         assert!(!second
-            .validate_upload_grant(&token, "template", HASH, 1000, 1001)
+            .claim_upload_grant(&token, "template", HASH, 1000, 1001)
             .await
             .expect("expired grant should be rejected"));
+        assert!(second
+            .claim_upload_grant(&token, "template", HASH, 1000, 999)
+            .await
+            .expect("grant issued by another instance should claim"));
+    }
+
+    #[tokio::test]
+    async fn upload_grant_is_single_use() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let store = PosixFsTemplateBuildFileStore::new(tempdir.path());
+        let token = store
+            .create_upload_grant("template", HASH, 1000)
+            .await
+            .expect("grant should be created");
+
+        assert!(store
+            .claim_upload_grant(&token, "template", HASH, 1000, 999)
+            .await
+            .expect("first claim should succeed"));
+        assert!(
+            !store
+                .claim_upload_grant(&token, "template", HASH, 1000, 999)
+                .await
+                .expect("replay should be rejected"),
+            "an upload URL must not be replayable"
+        );
+    }
+
+    #[tokio::test]
+    async fn archives_are_immutable_once_stored() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let store = PosixFsTemplateBuildFileStore::new(tempdir.path());
+
+        let first = staged_file(tempdir.path(), b"original");
+        store.import(HASH, &first).await.expect("first import");
+
+        let replacement = tempdir.path().join("replacement.tar");
+        fs::write(&replacement, b"replaced").expect("write replacement");
+        store
+            .import(HASH, &replacement)
+            .await
+            .expect("repeat import should be accepted");
+
+        let materialized = store
+            .materialize(HASH, tempdir.path())
+            .await
+            .expect("materialize should work")
+            .expect("archive should exist");
+        assert_eq!(
+            fs::read(materialized).expect("read materialized"),
+            b"original",
+            "a stored archive must never be replaced underneath a build"
+        );
     }
 }

@@ -53,6 +53,16 @@ impl TemplateBuildFileStore for OssTemplateBuildFileStore {
 
     async fn import(&self, hash: &str, staged: &Path) -> RepositoryResult<()> {
         let key = Self::archive_key(hash)?;
+        // Archives are immutable: the hash addresses the content, so a repeat
+        // upload cannot change what an in-flight build reads.
+        if self
+            .client
+            .exists(&key)
+            .await
+            .map_err(|error| RepositoryError::backend("check build archive", error))?
+        {
+            return Ok(());
+        }
         self.client
             .put_file(&key, staged)
             .await
@@ -102,7 +112,7 @@ impl TemplateBuildFileStore for OssTemplateBuildFileStore {
         Ok(token)
     }
 
-    async fn validate_upload_grant(
+    async fn claim_upload_grant(
         &self,
         token: &str,
         template_id: &str,
@@ -120,6 +130,17 @@ impl TemplateBuildFileStore for OssTemplateBuildFileStore {
         };
         let grant: TemplateBuildUploadGrant = serde_json::from_slice(&bytes)
             .map_err(|error| RepositoryError::backend("parse upload grant", error))?;
-        Ok(grant.authorizes(template_id, hash, expires_unix, now_unix))
+        if !grant.authorizes(template_id, hash, expires_unix, now_unix) {
+            return Ok(false);
+        }
+        // Consume the grant so the upload URL cannot be replayed. S3-compatible
+        // stores offer no conditional delete, so simultaneous replays of one
+        // token can both observe the grant; archives are immutable, which is
+        // what keeps that from mattering.
+        self.client
+            .delete(&key)
+            .await
+            .map_err(|error| RepositoryError::backend("consume upload grant", error))?;
+        Ok(true)
     }
 }
