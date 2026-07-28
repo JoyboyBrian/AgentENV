@@ -101,7 +101,11 @@ impl PosixFsCatalogStore {
                 store.write_committed_record_unlocked(&record)?;
                 // `write_json` uses an atomic rename. Keeping this as the final
                 // fallible operation means a failed rebuild leaves the old
-                // alias binding untouched.
+                // alias binding untouched. The tradeoff is a crash window: dying
+                // after the record write but before the alias write leaves a
+                // committed record whose `alias` field names an alias that still
+                // resolves to the previous snapshot, so readers of `record.alias`
+                // (listings) may observe the stale claim until the next rebind.
                 store.write_json(&alias_path, &snapshot_id)?;
 
                 if let Some(existing) = existing.filter(|existing| existing != &snapshot_id) {
@@ -109,29 +113,7 @@ impl PosixFsCatalogStore {
                     // sandboxes and explicit id references keep working. Alias
                     // metadata cleanup is best effort because the binding has
                     // already moved successfully.
-                    match store.load_record_by_id_unlocked(&existing) {
-                        Ok(Some(mut previous)) => {
-                            previous.alias = None;
-                            previous.updated_at_unix_ms = now;
-                            if let Err(error) = store.write_record_unlocked(&previous) {
-                                warn!(
-                                    alias = %alias,
-                                    previous_snapshot_id = %existing,
-                                    error = %error,
-                                    "failed to clear previous snapshot alias metadata"
-                                );
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            warn!(
-                                alias = %alias,
-                                previous_snapshot_id = %existing,
-                                error = %error,
-                                "failed to load previous snapshot alias metadata"
-                            );
-                        }
-                    }
+                    store.clear_moved_alias_on_previous_record(&existing, alias.as_ref(), now);
                 }
                 Ok(record)
             })
@@ -401,6 +383,67 @@ impl PosixFsCatalogStore {
         build.error_reason = Some(reason);
         record.updated_at_unix_ms = now;
         self.write_record_unlocked(&record)
+    }
+
+    /// Clears `moved_alias` from the record that owned it before a rebind.
+    ///
+    /// Best effort: the alias binding has already moved, so a failure here only
+    /// leaves stale alias metadata on the previous owner's record.
+    fn clear_moved_alias_on_previous_record(
+        &self,
+        previous_id: &SnapshotId,
+        moved_alias: &str,
+        now: i64,
+    ) {
+        // Lock order is alias lock first, then record lock; nothing takes them
+        // in the reverse order today.
+        let _guard = match self.acquire_record_lock(previous_id) {
+            Ok(guard) => guard,
+            Err(error) => {
+                warn!(
+                    alias = %moved_alias,
+                    previous_snapshot_id = %previous_id,
+                    error = %error,
+                    "failed to lock previous snapshot record for alias cleanup"
+                );
+                return;
+            }
+        };
+
+        let mut previous = match self.load_record_by_id_unlocked(previous_id) {
+            Ok(Some(previous)) => previous,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(
+                    alias = %moved_alias,
+                    previous_snapshot_id = %previous_id,
+                    error = %error,
+                    "failed to load previous snapshot alias metadata"
+                );
+                return;
+            }
+        };
+
+        // Only clear the alias this publish actually moved; the previous owner
+        // may already claim a different name.
+        let claims_moved_alias = previous
+            .alias
+            .as_ref()
+            .is_some_and(|alias| alias.as_ref() == moved_alias);
+        if !claims_moved_alias {
+            return;
+        }
+
+        previous.alias = None;
+        previous.updated_at_unix_ms = now;
+        if let Err(error) = self.write_record_unlocked(&previous) {
+            warn!(
+                alias = %moved_alias,
+                previous_snapshot_id = %previous_id,
+                error = %error,
+                "failed to clear previous snapshot alias metadata"
+            );
+        }
     }
 
     fn read_json<T>(&self, path: &Path) -> RepositoryResult<T>

@@ -376,7 +376,9 @@ impl Templates<()> for ApiImpl {
             }
         };
         let config = &crate::cfg::ConfigManager::global_config().template_build;
-        let expires = chrono::Utc::now().timestamp() + config.files_url_ttl_secs as i64;
+        let expires = chrono::Utc::now()
+            .timestamp()
+            .saturating_add(i64::try_from(config.files_url_ttl_secs).unwrap_or(i64::MAX));
         let token = match store.create_upload_grant(template_id, hash, expires).await {
             Ok(token) => token,
             Err(err) => {

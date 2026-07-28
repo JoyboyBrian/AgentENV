@@ -304,7 +304,12 @@ impl SnapshotRepository for OssSnapshotRepository {
 
             // 5. Commit the record before moving the alias. This prevents an
             //    alias from ever resolving to a snapshot whose catalog record
-            //    has not been published yet.
+            //    has not been published yet. The tradeoff is a crash window:
+            //    dying after the record write but before `bind_alias` leaves a
+            //    committed record whose `alias` field names an alias that still
+            //    resolves to the previous snapshot, so readers of `record.alias`
+            //    (listings) may observe the stale claim until the next rebind.
+            //    Nothing reconciles that state automatically.
             let previous_record = self.read_record(id).await?;
             let previous_alias_target = if let Some(alias) = metadata.alias.as_ref() {
                 match self.load_alias_target(alias.as_ref()).await? {
@@ -342,7 +347,7 @@ impl SnapshotRepository for OssSnapshotRepository {
                     .as_ref()
                     .filter(|previous_id| *previous_id != id)
                 {
-                    if let Err(error) = self.clear_record_alias(previous_id).await {
+                    if let Err(error) = self.clear_record_alias(previous_id, alias.as_ref()).await {
                         warn!(
                             alias = %alias,
                             previous_snapshot_id = %previous_id,
@@ -749,8 +754,11 @@ impl OssSnapshotRepository {
                 return;
             }
         };
-        // Do not overwrite a concurrent publisher that already moved the
-        // alias elsewhere.
+        // Skip when a concurrent publisher already moved the alias elsewhere.
+        // This only narrows the lost-update window: like `bind_alias`, the
+        // rollback cannot be atomic on a store without conditional writes, so a
+        // publisher that rebinds between this read and the write below is still
+        // clobbered.
         if current.as_ref() != Some(id) {
             return;
         }
@@ -786,9 +794,16 @@ impl OssSnapshotRepository {
 
     /// Clears the alias field on the record that previously owned a rebound
     /// alias so template listings do not report the moved name twice.
-    async fn clear_record_alias(&self, id: &SnapshotId) -> RepositoryResult<()> {
+    ///
+    /// Only `moved_alias` is cleared; a previous owner that already claims a
+    /// different name keeps it.
+    async fn clear_record_alias(&self, id: &SnapshotId, moved_alias: &str) -> RepositoryResult<()> {
         if let Some(mut previous) = self.read_record(id).await? {
-            if previous.alias.is_some() {
+            let claims_moved_alias = previous
+                .alias
+                .as_ref()
+                .is_some_and(|alias| alias.as_ref() == moved_alias);
+            if claims_moved_alias {
                 previous.alias = None;
                 previous.updated_at_unix_ms = now_unix_ms();
                 self.write_record(&previous).await?;

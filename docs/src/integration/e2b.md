@@ -123,6 +123,7 @@ Requirements and behavior notes:
 - Copied files are owned by `root:root` like Docker's `COPY` default. `COPY --chown=user:group` resolves names against the image's own `/etc/passwd` and `/etc/group` and applies only to the files the copy creates; an unknown user fails the build.
 - Write directory destinations with a trailing slash (`COPY app.py /opt/`). Docker's special case of copying a single file onto an existing directory named without a trailing slash (`COPY app.py /opt`) is not supported and fails the build with a clear error.
 - Rebuilding an existing alias is allowed: the alias keeps pointing at the previous template while the new build runs and moves to the new template when the build commits (E2B semantics). The previous template stays addressable by ID. A failed rebuild leaves the alias untouched.
+- Any TLS-terminated, gateway-fronted, or multi-hop deployment must set `template_build.public_base_url` (or `AENV_TEMPLATE_BUILD_PUBLIC_BASE_URL`) to the external origin clients reach, for example `https://agentenv.example.com`. When it is unset, the upload URL is derived from the request `Host` header with plain `http`, and because that URL carries a bearer token in its query string the upload either fails against an HTTPS-only listener or sends the token and the whole build context in cleartext. Direct-node and bundled-gateway deployments can keep the default.
 
 ## E2B CLI
 

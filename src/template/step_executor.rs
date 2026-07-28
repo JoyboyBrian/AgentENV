@@ -18,7 +18,9 @@ use crate::snapshot::CommandContext;
 /// this stays conservative rather than mirroring every libc name rule.
 fn is_valid_chown_spec(spec: &str) -> bool {
     fn valid_part(part: &str) -> bool {
+        // A leading '-' would be read as an option by the `id` lookup below.
         !part.is_empty()
+            && !part.starts_with('-')
             && part
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
@@ -73,6 +75,35 @@ impl TemplateStepExecutor {
                                 format!("WORKDIR {path}"),
                             )
                         })?;
+                    // Docker creates the directory. A bare `mkdir -p` matches
+                    // the classic builder: idempotent on an existing directory
+                    // without touching its metadata, and ENOTDIR on a file.
+                    // No cwd, because the current workdir may not exist.
+                    let script = format!("set -eu\nmkdir -p -- {}\n", shell_quote(&resolved));
+                    let output = sandbox
+                        .run_command_with_opts(
+                            "/bin/bash",
+                            &["-lc", &script],
+                            &ProcessOpts::default(),
+                        )
+                        .await
+                        .with_context(|| {
+                            TemplateBuildFailure::with_step(
+                                "build step failed: create workdir",
+                                format!("WORKDIR {path}"),
+                            )
+                        })?;
+                    if output.exit_code != 0 {
+                        return Err(TemplateBuildFailure::with_step(
+                            format!(
+                                "build step failed: creating the workdir exited with status {}{}",
+                                output.exit_code,
+                                command_output_suffix(&output.stdout, &output.stderr)
+                            ),
+                            format!("WORKDIR {path}"),
+                        )
+                        .into());
+                    }
                     context = context.with_workdir(resolved);
                 }
                 TemplateBuildStepKind::User { value } => {
@@ -202,10 +233,35 @@ impl TemplateStepExecutor {
             .await
             .with_context(|| with_step("build step failed: upload build context".to_string()))?;
 
-        let script = format!(
-            "tar -xpf {archive} -C /\nrc=$?\nrm -f {archive}\nif [ $rc -ne 0 ]; then exit $rc; fi\n",
+        // The plan never emits a header for the destination root, so a
+        // pre-existing destination keeps its metadata. Create it here when it
+        // is missing so a fresh destination still gets the requested metadata;
+        // `tar -C /` auto-creates any missing intermediate directory. File-only
+        // archives carry no directory member for the root, hence the
+        // `dest_is_dir` gate rather than `skipped_dest_root` alone.
+        let mut script = String::new();
+        if plan.skipped_dest_root || plan.dest_is_dir {
+            let dest_root = shell_quote(&plan.dest_root);
+            script.push_str(&format!("if [ ! -e {dest_root} ]; then\n"));
+            script.push_str(&format!("  mkdir -p -- {dest_root} || exit 1\n"));
+            if let Some(owner) = ownership {
+                script.push_str(&format!(
+                    "  chown {}:{} -- {dest_root} || exit 1\n",
+                    owner.uid, owner.gid
+                ));
+            }
+            if let Some(mode) = mode {
+                script.push_str(&format!("  chmod {mode:o} -- {dest_root} || exit 1\n"));
+            }
+            script.push_str("fi\n");
+        }
+        // `--no-overwrite-dir` (GNU tar) keeps extraction from restoring mode
+        // and ownership onto directories that already exist in the image;
+        // directories tar creates still receive the archive header's metadata.
+        script.push_str(&format!(
+            "tar -xp --no-overwrite-dir -f {archive} -C /\nrc=$?\nrm -f {archive}\nif [ $rc -ne 0 ]; then exit $rc; fi\n",
             archive = shell_quote(&guest_archive),
-        );
+        ));
 
         let output = sandbox
             .run_command_with_opts("/bin/bash", &["-lc", &script], &ProcessOpts::default())
@@ -238,7 +294,7 @@ impl TemplateStepExecutor {
         let script = format!(
             r#"set -eu
 case "{user}" in
-  *[!0-9]*) uid=$(id -u "{user}"); ugid=$(id -g "{user}") ;;
+  *[!0-9]*) uid=$(id -u -- "{user}"); ugid=$(id -g -- "{user}") ;;
   *) uid="{user}"; ugid="{user}" ;;
 esac
 if [ -n "{group}" ]; then
@@ -329,15 +385,19 @@ printf '%s %s\n' "$uid" "$gid"
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
+    use shell_util::shell_quote;
 
     use super::TemplateStepExecutor;
     use crate::sandbox::{Executor, ProcessHandle, ProcessOpts, ProcessOutput, SandboxExecutor};
     use crate::snapshot::CommandContext;
     use crate::template::build_spec::TemplateBuildStep;
 
+    /// Sandbox that fails any exec, so steps expected to stay host-side prove
+    /// they never touch the guest.
     struct NoopSandbox;
 
     #[async_trait(?Send)]
@@ -360,6 +420,59 @@ mod tests {
             _opts: &ProcessOpts,
         ) -> Result<ProcessHandle> {
             Err(anyhow!("not used"))
+        }
+    }
+
+    /// One recorded exec: command, arguments, and working directory.
+    type RecordedCommand = (String, Vec<String>, Option<String>);
+
+    /// Records every command a step issues and reports success.
+    #[derive(Default)]
+    struct RecordingSandbox {
+        commands: Mutex<Vec<RecordedCommand>>,
+    }
+
+    impl RecordingSandbox {
+        fn commands(&self) -> Vec<RecordedCommand> {
+            self.commands
+                .lock()
+                .expect("commands mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl SandboxExecutor for RecordingSandbox {
+        fn executor(&self) -> Result<Executor<'_>> {
+            Err(anyhow!("not used by this test"))
+        }
+        async fn run_command_with_opts(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            opts: &ProcessOpts,
+        ) -> Result<ProcessOutput> {
+            self.commands
+                .lock()
+                .expect("commands mutex should not be poisoned")
+                .push((
+                    cmd.to_string(),
+                    args.iter().map(|arg| (*arg).to_string()).collect(),
+                    opts.cwd.clone(),
+                ));
+            Ok(ProcessOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+        async fn start_process(
+            &self,
+            _cmd: &str,
+            _args: &[&str],
+            _opts: &ProcessOpts,
+        ) -> Result<ProcessHandle> {
+            Err(anyhow!("not used by this test"))
         }
     }
 
@@ -453,6 +566,8 @@ mod tests {
         assert!(!super::is_valid_chown_spec("user:group:extra"));
         assert!(!super::is_valid_chown_spec("user name"));
         assert!(!super::is_valid_chown_spec("user;rm -rf /"));
+        assert!(!super::is_valid_chown_spec("-r"));
+        assert!(!super::is_valid_chown_spec("user:-g"));
     }
 
     #[tokio::test]
@@ -474,7 +589,50 @@ mod tests {
 
     #[tokio::test]
     async fn workdir_step_updates_workdir() {
-        let ctx = run(vec![TemplateBuildStep::workdir("/workspace")]).await;
+        let sandbox = RecordingSandbox::default();
+        let ctx = TemplateStepExecutor::new()
+            .execute(
+                &sandbox,
+                &[TemplateBuildStep::workdir("/workspace")],
+                CommandContext::default(),
+                &HashMap::new(),
+            )
+            .await
+            .expect("steps should execute without error");
+
         assert_eq!(ctx.workdir, "/workspace");
+        let commands = sandbox.commands();
+        assert_eq!(commands.len(), 1);
+        assert!(
+            commands[0].1[1].contains(&shell_quote("/workspace")),
+            "WORKDIR must create the directory: {}",
+            commands[0].1[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn workdir_step_resolves_relative_paths() {
+        let sandbox = RecordingSandbox::default();
+        let ctx = TemplateStepExecutor::new()
+            .execute(
+                &sandbox,
+                &[
+                    TemplateBuildStep::workdir("/a"),
+                    TemplateBuildStep::workdir("b"),
+                ],
+                CommandContext::default(),
+                &HashMap::new(),
+            )
+            .await
+            .expect("steps should execute without error");
+
+        assert_eq!(ctx.workdir, "/a/b");
+        let commands = sandbox.commands();
+        assert_eq!(commands.len(), 2);
+        assert!(
+            commands[1].1[1].contains(&shell_quote("/a/b")),
+            "the second WORKDIR must create the resolved path: {}",
+            commands[1].1[1]
+        );
     }
 }
