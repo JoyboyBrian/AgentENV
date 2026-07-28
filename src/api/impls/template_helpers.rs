@@ -1,6 +1,7 @@
 use agentenv_http_server::models;
 
 use crate::cfg::ConfigManager;
+use crate::snapshot::repository::build_files::is_valid_build_files_hash;
 use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotRecord};
 use crate::template::TemplateBuildSpec;
 use crate::types::SandboxResources;
@@ -248,6 +249,17 @@ fn apply_e2b_template_step(
                     ),
                 ));
             };
+            // The hash is an opaque cache key that becomes part of an archive
+            // path, so it must be shape-checked before the build starts.
+            if !is_valid_build_files_hash(files_hash) {
+                return Err(models::Error::new(
+                    400,
+                    format!(
+                        "{} template step filesHash '{files_hash}' is not a valid build files hash",
+                        step.r_type
+                    ),
+                ));
+            }
             let src = args
                 .first()
                 .map(|value| value.trim())
@@ -414,6 +426,16 @@ mod tests {
             .expect_err("a mode above 7777 should be rejected");
         assert_eq!(err.code, 400);
         assert!(err.message.contains("10000"), "{}", err.message);
+    }
+
+    #[test]
+    fn copy_step_rejects_a_malformed_files_hash() {
+        let mut copy = copy_step(&["src", "/dest"]);
+        copy.files_hash = Some("../../etc/passwd".to_string());
+
+        let err = apply(&copy).expect_err("a malformed filesHash should be rejected");
+        assert_eq!(err.code, 400);
+        assert!(err.message.contains("../../etc/passwd"), "{}", err.message);
     }
 
     #[test]

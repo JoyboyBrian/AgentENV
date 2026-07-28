@@ -94,8 +94,9 @@ where
         );
     };
 
-    // Verification does not consume the grant, so an upload that fails before
-    // the archive is stored can be retried with the same URL.
+    // Verification does not consume the grant: consumption happens only after
+    // the archive has been durably published, so an upload that fails while
+    // streaming, staging, or storing the body stays retryable with this URL.
     let now_unix = chrono::Utc::now().timestamp();
     let authorized = match store
         .verify_upload_grant(&query.token, &template_id, &hash, query.expires, now_unix)
@@ -214,10 +215,28 @@ where
     };
     drop(file);
 
-    // Consuming the grant here keeps a failed upload retryable while the
-    // atomic remove/delete still picks a single winner among concurrent
-    // replays. `now_unix` is the timestamp taken before the body was read, so
-    // a slow but authorized upload is not rejected for aging past the TTL.
+    // Publishing before the grant is consumed keeps a failed store retryable
+    // with the same URL. An unclaimed replay reaching this point is harmless:
+    // the token authorizes exactly this template_id/hash and `import` is
+    // first-write-wins, so it can neither publish a different key nor change
+    // what is already stored.
+    //
+    // `hash` is the cache key the SDK computed for this build context, not a
+    // digest of the received bytes that the server verified.
+    if let Err(error) = store.import(&hash, &staged_path).await {
+        warn!(error = %error, hash, "failed to import build archive");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to store build archive; the upload can be retried with the same link",
+        );
+    }
+
+    // The archive is published, so the claim only enforces single-use: the
+    // atomic remove/delete picks a single winner among concurrent replays, and
+    // a replay that loses the race is rejected even though the archive it
+    // uploaded is stored. `now_unix` is the timestamp taken before the body was
+    // read, so a slow but authorized upload is not rejected for aging past the
+    // TTL.
     let claimed = match store
         .claim_upload_grant(&query.token, &template_id, &hash, query.expires, now_unix)
         .await
@@ -235,16 +254,6 @@ where
         return error_response(
             StatusCode::UNAUTHORIZED,
             "upload grant is invalid, expired, or already used; request a fresh upload link",
-        );
-    }
-
-    // `hash` is the cache key the SDK computed for this build context, not a
-    // digest of the received bytes that the server verified.
-    if let Err(error) = store.import(&hash, &staged_path).await {
-        warn!(error = %error, hash, "failed to import build archive");
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to store build archive",
         );
     }
 

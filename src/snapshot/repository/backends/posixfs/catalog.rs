@@ -162,23 +162,33 @@ impl PosixFsCatalogStore {
             self.with_alias_lock(alias, |store| {
                 store.write_record_unlocked(&record)?;
                 let alias_path = PosixFsSnapshotArtifactLayout::alias_path(&store.root, alias);
-                match store.load_alias_target(alias)? {
-                    // The alias currently points at a live snapshot. Leave the
-                    // binding untouched so the existing template keeps resolving
-                    // while the new build runs; a successful commit moves the
-                    // alias to the new snapshot (E2B rebuild semantics).
-                    Some(existing)
-                        if existing != record.id
-                            && store.load_record_by_id_unlocked(&existing)?.is_some() =>
-                    {
-                        Ok(())
+                let bind = (|| -> RepositoryResult<()> {
+                    match store.load_alias_target(alias)? {
+                        // The alias currently points at a live snapshot. Leave the
+                        // binding untouched so the existing template keeps resolving
+                        // while the new build runs; a successful commit moves the
+                        // alias to the new snapshot (E2B rebuild semantics).
+                        Some(existing)
+                            if existing != record.id
+                                && store.load_record_by_id_unlocked(&existing)?.is_some() =>
+                        {
+                            Ok(())
+                        }
+                        Some(existing) if existing != record.id => {
+                            store.remove_file_if_exists(&alias_path)?;
+                            store.write_json(&alias_path, &record.id)
+                        }
+                        _ => store.write_json(&alias_path, &record.id),
                     }
-                    Some(existing) if existing != record.id => {
-                        store.remove_file_if_exists(&alias_path)?;
-                        store.write_json(&alias_path, &record.id)
-                    }
-                    _ => store.write_json(&alias_path, &record.id),
+                })();
+                if let Err(error) = bind {
+                    // Keep creation all-or-nothing under the alias lock: a record
+                    // that survives a failed binding claims the alias in listings
+                    // with nothing left to reconcile it.
+                    let _ = store.remove_file_if_exists(&store.record_path(&record.id));
+                    return Err(error);
                 }
+                Ok(())
             })?;
         } else {
             self.write_record_unlocked(&record)?;

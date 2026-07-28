@@ -863,6 +863,12 @@ impl AppConfig {
                 cfg.files_url_ttl_secs
             );
         }
+        if cfg.files_max_upload_mib == 0 {
+            bail!("template_build.files_max_upload_mib must be > 0");
+        }
+        if cfg.files_max_context_mib == 0 {
+            bail!("template_build.files_max_context_mib must be > 0");
+        }
         if cfg.files_max_build_context_mib == 0 {
             bail!("template_build.files_max_build_context_mib must be > 0");
         }
@@ -1357,6 +1363,24 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(
             err.to_string().contains("must be <= files_url_ttl_secs"),
+            "unexpected error: {err}"
+        );
+
+        let mut config = AppConfig::default();
+        config.template_build.files_max_upload_mib = 0;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("template_build.files_max_upload_mib must be > 0"),
+            "unexpected error: {err}"
+        );
+
+        let mut config = AppConfig::default();
+        config.template_build.files_max_context_mib = 0;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("template_build.files_max_context_mib must be > 0"),
             "unexpected error: {err}"
         );
 
