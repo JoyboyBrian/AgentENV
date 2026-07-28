@@ -224,7 +224,18 @@ where
     I: AsRef<ApiImpl> + Send + Sync,
 {
     if !has_routing_header(request.headers()) {
-        return StatusCode::NOT_FOUND.into_response();
+        // Unmatched control-plane route: return the API error envelope so
+        // JSON clients surface "route not found" instead of failing to parse
+        // an empty 404 body.
+        let error = agentenv_http_server::models::Error::new(
+            404,
+            format!(
+                "route not found: {} {}",
+                request.method(),
+                request.uri().path()
+            ),
+        );
+        return (StatusCode::NOT_FOUND, axum::Json(error)).into_response();
     }
     let forward_path = request.uri().path().to_owned();
     with_route_source(
