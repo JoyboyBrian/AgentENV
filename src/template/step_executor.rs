@@ -6,8 +6,9 @@ use shell_util::shell_quote;
 use tracing::debug;
 
 use super::build_spec::{TemplateBuildStep, TemplateBuildStepKind};
-use super::copy_plan::plan_copy_archive;
+use super::copy_plan::{plan_copy_archive, resolve_guest_path, CopyOwnership, CopyRequest};
 use super::errors::{command_output_suffix, TemplateBuildFailure};
+use crate::cfg::ConfigManager;
 use crate::sandbox::{ProcessOpts, SandboxExecutor};
 use crate::snapshot::CommandContext;
 
@@ -62,7 +63,17 @@ impl TemplateStepExecutor {
                     context = context.with_env_var(key.clone(), value.clone());
                 }
                 TemplateBuildStepKind::Workdir { path } => {
-                    context = context.with_workdir(path.to_string_lossy());
+                    // Docker resolves a relative WORKDIR against the current
+                    // one; only absolute values replace it outright.
+                    let path = path.to_string_lossy();
+                    let resolved =
+                        resolve_guest_path(&context.workdir, &path).with_context(|| {
+                            TemplateBuildFailure::with_step(
+                                format!("build step failed: invalid workdir '{path}'"),
+                                format!("WORKDIR {path}"),
+                            )
+                        })?;
+                    context = context.with_workdir(resolved);
                 }
                 TemplateBuildStepKind::User { value } => {
                     context = context.with_user(Some(value.clone()));
@@ -148,17 +159,40 @@ impl TemplateStepExecutor {
             }
         }
 
+        // Resolve --chown against the image's own accounts, like Docker, and
+        // bake the numeric result into the archive headers. Applying it after
+        // extraction with `chown -R` would also rewrite pre-existing files
+        // under the destination.
+        let ownership = match user {
+            Some(user) => Some(self.resolve_ownership(sandbox, user, &step_label).await?),
+            None => None,
+        };
+
         let rewritten = tempfile::Builder::new()
             .prefix("agentenv-copy-")
             .suffix(".tar")
             .tempfile()
             .context("create rewritten copy archive")?;
-        let plan = plan_copy_archive(archive, src, dest, &context.workdir, mode, rewritten.path())
-            .map_err(|error| with_step(format!("build step failed: {error:#}")))?;
+        let plan = plan_copy_archive(
+            &CopyRequest {
+                source_tar: archive,
+                src,
+                dest,
+                workdir: &context.workdir,
+                mode,
+                ownership,
+                max_total_bytes: ConfigManager::global_config()
+                    .template_build
+                    .files_max_context_mib
+                    .saturating_mul(1024 * 1024),
+            },
+            rewritten.path(),
+        )
+        .map_err(|error| with_step(format!("build step failed: {error:#}")))?;
         debug!(
             files_hash,
             entries = plan.entry_count,
-            roots = ?plan.created_roots,
+            bytes = plan.total_bytes,
             "prepared copy archive"
         );
 
@@ -168,21 +202,10 @@ impl TemplateStepExecutor {
             .await
             .with_context(|| with_step("build step failed: upload build context".to_string()))?;
 
-        let mut script = format!(
+        let script = format!(
             "tar -xpf {archive} -C /\nrc=$?\nrm -f {archive}\nif [ $rc -ne 0 ]; then exit $rc; fi\n",
             archive = shell_quote(&guest_archive),
         );
-        if let Some(user) = user {
-            let roots = plan
-                .created_roots
-                .iter()
-                .map(|root| shell_quote(root))
-                .collect::<Vec<_>>()
-                .join(" ");
-            if !roots.is_empty() {
-                script.push_str(&format!("chown -R {} {roots}\n", shell_quote(user)));
-            }
-        }
 
         let output = sandbox
             .run_command_with_opts("/bin/bash", &["-lc", &script], &ProcessOpts::default())
@@ -197,6 +220,79 @@ impl TemplateStepExecutor {
             return Err(with_step(message).into());
         }
         Ok(())
+    }
+
+    /// Resolves a `--chown` spec to numeric ids inside the build sandbox.
+    ///
+    /// Docker resolves names against the image's own `/etc/passwd` and
+    /// `/etc/group`, so the lookup has to happen in the guest. Failing here
+    /// reports an unknown user the same way Docker does rather than silently
+    /// falling back to root.
+    async fn resolve_ownership(
+        &self,
+        sandbox: &impl SandboxExecutor,
+        user: &str,
+        step_label: &str,
+    ) -> Result<CopyOwnership> {
+        let (user_part, group_part) = user.split_once(':').unwrap_or((user, ""));
+        let script = format!(
+            r#"set -eu
+case "{user}" in
+  *[!0-9]*) uid=$(id -u "{user}"); ugid=$(id -g "{user}") ;;
+  *) uid="{user}"; ugid="{user}" ;;
+esac
+if [ -n "{group}" ]; then
+  case "{group}" in
+    *[!0-9]*) gid=$(awk -F: -v n="{group}" '$1==n{{print $3; f=1}} END{{exit !f}}' /etc/group) ;;
+    *) gid="{group}" ;;
+  esac
+else
+  gid="$ugid"
+fi
+printf '%s %s\n' "$uid" "$gid"
+"#,
+            user = user_part,
+            group = group_part,
+        );
+
+        let output = sandbox
+            .run_command_with_opts("/bin/bash", &["-lc", &script], &ProcessOpts::default())
+            .await
+            .with_context(|| {
+                TemplateBuildFailure::with_step(
+                    "build step failed: resolve COPY ownership".to_string(),
+                    step_label,
+                )
+            })?;
+        if output.exit_code != 0 {
+            return Err(TemplateBuildFailure::with_step(
+                format!(
+                    "build step failed: COPY user '{user}' does not exist in the image{}",
+                    command_output_suffix(&output.stdout, &output.stderr)
+                ),
+                step_label,
+            )
+            .into());
+        }
+
+        let parsed = output
+            .stdout
+            .split_whitespace()
+            .map(str::parse::<u64>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()
+            .filter(|ids| ids.len() == 2);
+        let Some(ids) = parsed else {
+            return Err(TemplateBuildFailure::with_step(
+                format!("build step failed: could not resolve COPY user '{user}'"),
+                step_label,
+            )
+            .into());
+        };
+        Ok(CopyOwnership {
+            uid: ids[0],
+            gid: ids[1],
+        })
     }
 
     async fn run_step(

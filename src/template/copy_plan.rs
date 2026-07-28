@@ -6,9 +6,12 @@
 //! carries its final absolute guest path per Docker `COPY` semantics; the
 //! build sandbox then only needs a single `tar -xpf archive -C /`.
 //!
-//! Ownership is normalized to root:root (Docker's `COPY` default — the SDK
-//! archive carries the uploader's local uids); an explicit `--chown` user is
-//! applied afterwards with `chown -R` on the created roots.
+//! The rewrite runs in two passes so an archive is never held in memory: the
+//! first pass indexes entry paths to compute the mapping, the second streams
+//! each entry's bytes straight into the rewritten archive.
+//!
+//! Ownership is written into the rewritten headers rather than applied with a
+//! post-extract `chown`, so a copy can only ever change the files it creates.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
@@ -16,25 +19,48 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+/// Upper bound on entries in one build-context archive. The indexing pass
+/// keeps one normalized path per entry, so this bounds that allocation
+/// independently of the byte budget: an archive of a million empty files is
+/// tiny but path-heavy. Real build contexts are orders of magnitude smaller.
+const MAX_ARCHIVE_ENTRIES: usize = 200_000;
+
+/// Numeric ownership applied to every entry of one copy.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CopyOwnership {
+    pub(crate) uid: u64,
+    pub(crate) gid: u64,
+}
+
+/// Inputs for rewriting one `COPY` step's archive.
+pub(crate) struct CopyRequest<'a> {
+    pub(crate) source_tar: &'a Path,
+    pub(crate) src: &'a str,
+    pub(crate) dest: &'a str,
+    pub(crate) workdir: &'a str,
+    pub(crate) mode: Option<u32>,
+    /// Ownership requested by `--chown`, already resolved to numeric ids
+    /// inside the build sandbox. `None` keeps Docker's root:root default.
+    pub(crate) ownership: Option<CopyOwnership>,
+    /// Budget for the decompressed archive, bounding both the rewritten file
+    /// on the host and what a single upload can expand to.
+    pub(crate) max_total_bytes: u64,
+}
+
 /// Summary of a rewritten copy archive.
 #[derive(Debug)]
 pub(crate) struct CopyPlan {
-    /// Absolute guest paths of the top-level items this copy creates, used
-    /// for the optional post-extract `chown -R`.
-    pub(crate) created_roots: Vec<String>,
     /// Number of file/dir/symlink entries written to the rewritten archive.
     pub(crate) entry_count: usize,
+    /// Total file bytes written to the rewritten archive.
+    pub(crate) total_bytes: u64,
 }
 
-/// One entry read from the SDK context archive.
-struct SourceEntry {
+/// One archive entry as seen by the indexing pass.
+struct EntryIndex {
     /// Normalized context-relative path ("dir/file.txt").
     path: String,
-    header: tar::Header,
-    link_name: Option<std::path::PathBuf>,
-    /// Byte range of the entry data within the decompressed stream is not
-    /// seekable, so file contents are buffered per entry during rewrite.
-    data: Vec<u8>,
+    is_dir: bool,
 }
 
 fn is_glob_pattern(src: &str) -> bool {
@@ -101,20 +127,18 @@ fn normalize_src(src: &str) -> String {
     src.trim_end_matches('/').to_string()
 }
 
-/// Joins and lexically normalizes an absolute guest destination path.
-fn resolve_dest(dest: &str, workdir: &str) -> Result<String> {
-    let joined = if dest.starts_with('/') {
-        dest.to_string()
+/// Joins `path` onto `base` and lexically normalizes the result into an
+/// absolute guest path. Absolute `path` values replace `base` entirely, which
+/// is how Docker resolves both `WORKDIR` and `COPY` destinations.
+pub(crate) fn resolve_guest_path(base: &str, path: &str) -> Result<String> {
+    let joined = if path.starts_with('/') {
+        path.to_string()
     } else {
-        let workdir = if workdir.trim().is_empty() {
-            "/"
-        } else {
-            workdir
-        };
-        if !workdir.starts_with('/') {
-            bail!("workdir '{workdir}' must be absolute to resolve relative COPY destination");
+        let base = if base.trim().is_empty() { "/" } else { base };
+        if !base.starts_with('/') {
+            bail!("cannot resolve '{path}' against non-absolute base '{base}'");
         }
-        format!("{}/{}", workdir.trim_end_matches('/'), dest)
+        format!("{}/{}", base.trim_end_matches('/'), path)
     };
 
     let mut parts: Vec<&str> = Vec::new();
@@ -123,7 +147,7 @@ fn resolve_dest(dest: &str, workdir: &str) -> Result<String> {
             "" | "." => {}
             ".." => {
                 if parts.pop().is_none() {
-                    bail!("COPY destination '{dest}' escapes the filesystem root");
+                    bail!("path '{path}' escapes the filesystem root");
                 }
             }
             part => parts.push(part),
@@ -168,7 +192,8 @@ fn normalize_entry_path(raw: &Path) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-fn read_source_entries(source_tar: &Path) -> Result<Vec<SourceEntry>> {
+/// Opens the uploaded archive, transparently decompressing gzip.
+fn open_archive(source_tar: &Path) -> Result<tar::Archive<Box<dyn Read>>> {
     let mut file = File::open(source_tar)
         .with_context(|| format!("open build context archive '{}'", source_tar.display()))?;
     let mut magic = [0u8; 2];
@@ -184,93 +209,96 @@ fn read_source_entries(source_tar: &Path) -> Result<Vec<SourceEntry>> {
     } else {
         Box::new(BufReader::new(file))
     };
+    Ok(tar::Archive::new(reader))
+}
 
-    let mut archive = tar::Archive::new(reader);
-    let mut entries = Vec::new();
+fn check_entry_type(entry_type: tar::EntryType) -> Result<()> {
+    match entry_type {
+        tar::EntryType::Regular
+        | tar::EntryType::Directory
+        | tar::EntryType::Symlink
+        | tar::EntryType::GNUSparse => Ok(()),
+        // Metadata-only companion entries (long names, pax headers) are
+        // consumed by the tar crate itself and never surface here.
+        other => bail!("unsupported entry type {other:?} in build context archive"),
+    }
+}
+
+/// First pass: index entry paths and enforce the archive budgets without
+/// reading any file contents.
+fn read_entry_index(source_tar: &Path, max_total_bytes: u64) -> Result<Vec<EntryIndex>> {
+    let mut archive = open_archive(source_tar)?;
+    let mut index = Vec::new();
+    let mut total_bytes = 0u64;
+
     for entry in archive
         .entries()
         .context("read build context archive entries")?
     {
-        let mut entry = entry.context("read build context archive entry")?;
+        let entry = entry.context("read build context archive entry")?;
         let entry_type = entry.header().entry_type();
-        match entry_type {
-            tar::EntryType::Regular
-            | tar::EntryType::Directory
-            | tar::EntryType::Symlink
-            | tar::EntryType::GNUSparse => {}
-            // Metadata-only companion entries (long names, pax headers) are
-            // consumed by the tar crate itself and never surface here.
-            other => bail!("unsupported entry type {other:?} in build context archive"),
+        check_entry_type(entry_type)?;
+
+        total_bytes = total_bytes.saturating_add(entry.size());
+        if total_bytes > max_total_bytes {
+            bail!(
+                "build context archive expands beyond the configured limit of \
+                 {max_total_bytes} bytes"
+            );
+        }
+        if index.len() >= MAX_ARCHIVE_ENTRIES {
+            bail!("build context archive holds more than {MAX_ARCHIVE_ENTRIES} entries");
         }
 
-        let path = normalize_entry_path(&entry.path().context("entry path")?)?;
-        let link_name = entry
-            .link_name()
-            .context("entry link name")?
-            .map(|l| l.into_owned());
-        let mut data = Vec::new();
-        if entry_type == tar::EntryType::Regular || entry_type == tar::EntryType::GNUSparse {
-            entry.read_to_end(&mut data).context("entry contents")?;
-        }
-        entries.push(SourceEntry {
-            path,
-            header: entry.header().clone(),
-            link_name,
-            data,
+        index.push(EntryIndex {
+            path: normalize_entry_path(&entry.path().context("entry path")?)?,
+            is_dir: entry_type == tar::EntryType::Directory,
         });
     }
-    if entries.is_empty() {
+
+    if index.is_empty() {
         bail!("build context archive contains no files");
     }
-    Ok(entries)
+    Ok(index)
 }
 
-/// Computes the final absolute guest path for every entry.
+/// Computes the final absolute guest path for every indexed entry.
 ///
-/// Returns `(mappings, created_roots)` where `mappings[i]` matches
-/// `entries[i]`.
+/// The returned vector is positionally aligned with `index`.
 fn map_entries(
-    entries: &[SourceEntry],
+    index: &[EntryIndex],
     src: &str,
     dest_raw: &str,
     workdir: &str,
-) -> Result<(Vec<String>, Vec<String>)> {
+) -> Result<Vec<String>> {
     let src = normalize_src(src);
     let dest_is_dir_hint = dest_raw.ends_with('/')
         || dest_raw.ends_with("/.")
         || dest_raw == "."
         || dest_raw.is_empty();
-    let dest = resolve_dest(if dest_raw.is_empty() { "." } else { dest_raw }, workdir)?;
+    let dest = resolve_guest_path(workdir, if dest_raw.is_empty() { "." } else { dest_raw })?;
 
-    let mut mapped = Vec::with_capacity(entries.len());
-    let mut roots: Vec<String> = Vec::new();
-    let mut push_root = |root: String| {
-        if !roots.contains(&root) {
-            roots.push(root);
-        }
-    };
+    let mut mapped = Vec::with_capacity(index.len());
 
     let copy_whole_context = src.is_empty() || src == ".";
     let single_file_src = !copy_whole_context
         && !is_glob_pattern(&src)
-        && entries.len() == 1
-        && entries[0].path == src
-        && entries[0].header.entry_type() != tar::EntryType::Directory;
+        && index.len() == 1
+        && index[0].path == src
+        && !index[0].is_dir;
 
     if single_file_src {
-        let target = if dest_is_dir_hint {
+        mapped.push(if dest_is_dir_hint {
             join_abs(&dest, base_name(&src))
         } else {
-            dest.clone()
-        };
-        push_root(target.clone());
-        mapped.push(target);
-        return Ok((mapped, roots));
+            dest
+        });
+        return Ok(mapped);
     }
 
     if copy_whole_context || !is_glob_pattern(&src) {
         // Directory source: Docker copies the directory *contents* into dest.
-        for entry in entries {
+        for entry in index {
             let rel = if copy_whole_context {
                 entry.path.as_str()
             } else if entry.path == src {
@@ -286,14 +314,13 @@ fn map_entries(
             };
             mapped.push(join_abs(&dest, rel));
         }
-        push_root(dest.clone());
-        return Ok((mapped, roots));
+        return Ok(mapped);
     }
 
     // Glob source: every matched top-level item lands inside dest. Matched
     // files keep their base name; matched directories contribute their
     // contents (Docker treats each matched directory like a directory source).
-    for entry in entries {
+    for entry in index {
         let mut components = entry.path.split('/');
         let mut prefix = String::new();
         let mut matched_root: Option<String> = None;
@@ -321,54 +348,71 @@ fn map_entries(
             .strip_prefix(&root)
             .map(|rest| rest.trim_start_matches('/'))
             .unwrap_or("");
-        let target = if rel.is_empty() && entry.header.entry_type() != tar::EntryType::Directory {
-            let target = join_abs(&dest, base_name(&root));
-            push_root(target.clone());
-            target
+        mapped.push(if rel.is_empty() && !entry.is_dir {
+            join_abs(&dest, base_name(&root))
         } else {
-            push_root(dest.clone());
             join_abs(&dest, rel)
-        };
-        mapped.push(target);
+        });
     }
-    Ok((mapped, roots))
+    Ok(mapped)
 }
 
 /// Rewrites the SDK context archive into `output` with final absolute guest
-/// paths, root ownership, and the optional mode override applied.
-pub(crate) fn plan_copy_archive(
-    source_tar: &Path,
-    src: &str,
-    dest: &str,
-    workdir: &str,
-    mode_override: Option<u32>,
-    output: &Path,
-) -> Result<CopyPlan> {
-    let entries = read_source_entries(source_tar)?;
-    let (mapped, created_roots) = map_entries(&entries, src, dest, workdir)?;
+/// paths, the requested ownership, and the optional mode override applied.
+pub(crate) fn plan_copy_archive(request: &CopyRequest<'_>, output: &Path) -> Result<CopyPlan> {
+    let index = read_entry_index(request.source_tar, request.max_total_bytes)?;
+    let targets = map_entries(&index, request.src, request.dest, request.workdir)?;
 
     let out_file = File::create(output)
         .with_context(|| format!("create rewritten copy archive '{}'", output.display()))?;
     let mut builder = tar::Builder::new(out_file);
     let mut entry_count = 0usize;
+    let mut total_bytes = 0u64;
+    let mut seen = 0usize;
 
-    for (entry, target) in entries.iter().zip(mapped.iter()) {
+    // Second pass: stream each entry's bytes into the rewritten archive.
+    let mut archive = open_archive(request.source_tar)?;
+    for entry in archive
+        .entries()
+        .context("read build context archive entries")?
+    {
+        let mut entry = entry.context("read build context archive entry")?;
+        let Some(target) = targets.get(seen) else {
+            bail!("build context archive changed while it was being rewritten");
+        };
+        seen += 1;
+
         let relative = target.trim_start_matches('/');
         if relative.is_empty() {
             // The destination root itself ("/"); parents always exist.
             continue;
         }
 
-        let mut header = entry.header.clone();
-        header.set_uid(0);
-        header.set_gid(0);
-        let _ = header.set_username("");
-        let _ = header.set_groupname("");
-        if let Some(mode) = mode_override {
+        let entry_type = entry.header().entry_type();
+        check_entry_type(entry_type)?;
+        let link_name = entry
+            .link_name()
+            .context("entry link name")?
+            .map(|link| link.into_owned());
+        let mut header = entry.header().clone();
+        let (uid, gid) = request
+            .ownership
+            .map_or((0, 0), |owner| (owner.uid, owner.gid));
+        header.set_uid(uid);
+        header.set_gid(gid);
+        // Clear the name fields so the numeric ids above are authoritative.
+        // GNU tar prefers uname/gname when they resolve in the target image,
+        // so leaving the uploader's account names in place could hand files
+        // to an unrelated guest account.
+        header
+            .set_username("")
+            .and_then(|()| header.set_groupname(""))
+            .with_context(|| format!("clear ownership names on entry '{target}'"))?;
+        if let Some(mode) = request.mode {
             header.set_mode(mode);
         }
 
-        match entry.header.entry_type() {
+        match entry_type {
             tar::EntryType::Directory => {
                 header.set_size(0);
                 builder
@@ -376,31 +420,37 @@ pub(crate) fn plan_copy_archive(
                     .with_context(|| format!("write directory entry '{target}'"))?;
             }
             tar::EntryType::Symlink => {
-                let link = entry
-                    .link_name
-                    .as_ref()
-                    .context("symlink entry is missing its target")?;
+                let link = link_name.context("symlink entry is missing its target")?;
                 header.set_size(0);
                 builder
-                    .append_link(&mut header, relative, link)
+                    .append_link(&mut header, relative, &link)
                     .with_context(|| format!("write symlink entry '{target}'"))?;
             }
             _ => {
-                header.set_size(entry.data.len() as u64);
+                let size = entry.size();
+                header.set_size(size);
+                // A GNU sparse entry is read back expanded, so the rewritten
+                // entry is a plain regular file.
+                header.set_entry_type(tar::EntryType::Regular);
                 builder
-                    .append_data(&mut header, relative, entry.data.as_slice())
+                    .append_data(&mut header, relative, &mut entry)
                     .with_context(|| format!("write file entry '{target}'"))?;
+                total_bytes += size;
             }
         }
         entry_count += 1;
+    }
+
+    if seen != targets.len() {
+        bail!("build context archive changed while it was being rewritten");
     }
 
     let mut out_file = builder.into_inner().context("finish rewritten archive")?;
     out_file.flush().context("flush rewritten archive")?;
 
     Ok(CopyPlan {
-        created_roots,
         entry_count,
+        total_bytes,
     })
 }
 
@@ -409,6 +459,25 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use tempfile::TempDir;
+
+    const NO_LIMIT: u64 = u64::MAX;
+
+    fn request<'a>(
+        source_tar: &'a Path,
+        src: &'a str,
+        dest: &'a str,
+        workdir: &'a str,
+    ) -> CopyRequest<'a> {
+        CopyRequest {
+            source_tar,
+            src,
+            dest,
+            workdir,
+            mode: None,
+            ownership: None,
+            max_total_bytes: NO_LIMIT,
+        }
+    }
 
     fn build_source_tar(dir: &Path, entries: &[(&str, Option<&str>)]) -> std::path::PathBuf {
         // (path, Some(contents)) = file, (path, None) = directory
@@ -442,7 +511,15 @@ mod tests {
         tar_path
     }
 
-    fn rewritten_entries(path: &Path) -> BTreeMap<String, (tar::EntryType, u64, u32, String)> {
+    struct Rewritten {
+        kind: tar::EntryType,
+        uid: u64,
+        gid: u64,
+        mode: u32,
+        contents: String,
+    }
+
+    fn rewritten_entries(path: &Path) -> BTreeMap<String, Rewritten> {
         let mut archive = tar::Archive::new(File::open(path).expect("open rewritten"));
         let mut out = BTreeMap::new();
         for entry in archive.entries().expect("entries") {
@@ -450,10 +527,20 @@ mod tests {
             let path = entry.path().expect("path").to_string_lossy().into_owned();
             let kind = entry.header().entry_type();
             let uid = entry.header().uid().expect("uid");
+            let gid = entry.header().gid().expect("gid");
             let mode = entry.header().mode().expect("mode");
             let mut contents = String::new();
             entry.read_to_string(&mut contents).expect("read");
-            out.insert(path, (kind, uid, mode, contents));
+            out.insert(
+                path,
+                Rewritten {
+                    kind,
+                    uid,
+                    gid,
+                    mode,
+                    contents,
+                },
+            );
         }
         out
     }
@@ -465,15 +552,16 @@ mod tests {
         let out = dir.path().join("out.tar");
 
         let plan =
-            plan_copy_archive(&tar, "hello.txt", "/hello.txt", "/", None, &out).expect("plan");
+            plan_copy_archive(&request(&tar, "hello.txt", "/hello.txt", "/"), &out).expect("plan");
 
         assert_eq!(plan.entry_count, 1);
-        assert_eq!(plan.created_roots, vec!["/hello.txt".to_string()]);
+        assert_eq!(plan.total_bytes, 6);
         let entries = rewritten_entries(&out);
-        let (kind, uid, _, contents) = &entries["hello.txt"];
-        assert_eq!(*kind, tar::EntryType::Regular);
-        assert_eq!(*uid, 0, "ownership must be normalized to root");
-        assert_eq!(contents, "hello\n");
+        let entry = &entries["hello.txt"];
+        assert_eq!(entry.kind, tar::EntryType::Regular);
+        assert_eq!(entry.uid, 0, "ownership must default to root");
+        assert_eq!(entry.gid, 0);
+        assert_eq!(entry.contents, "hello\n");
     }
 
     #[test]
@@ -482,15 +570,10 @@ mod tests {
         let tar = build_source_tar(dir.path(), &[("requirements.txt", Some("e2b\n"))]);
         let out = dir.path().join("out.tar");
 
-        let plan = plan_copy_archive(&tar, "requirements.txt", "/home/user/", "/", None, &out)
+        plan_copy_archive(&request(&tar, "requirements.txt", "/home/user/", "/"), &out)
             .expect("plan");
 
-        assert_eq!(
-            plan.created_roots,
-            vec!["/home/user/requirements.txt".to_string()]
-        );
-        let entries = rewritten_entries(&out);
-        assert!(entries.contains_key("home/user/requirements.txt"));
+        assert!(rewritten_entries(&out).contains_key("home/user/requirements.txt"));
     }
 
     #[test]
@@ -499,12 +582,9 @@ mod tests {
         let tar = build_source_tar(dir.path(), &[("config.py", Some("x = 1\n"))]);
         let out = dir.path().join("out.tar");
 
-        let plan =
-            plan_copy_archive(&tar, "config.py", "conf/app.py", "/srv", None, &out).expect("plan");
+        plan_copy_archive(&request(&tar, "config.py", "conf/app.py", "/srv"), &out).expect("plan");
 
-        assert_eq!(plan.created_roots, vec!["/srv/conf/app.py".to_string()]);
-        let entries = rewritten_entries(&out);
-        assert!(entries.contains_key("srv/conf/app.py"));
+        assert!(rewritten_entries(&out).contains_key("srv/conf/app.py"));
     }
 
     #[test]
@@ -521,9 +601,8 @@ mod tests {
         );
         let out = dir.path().join("out.tar");
 
-        let plan = plan_copy_archive(&tar, "app", "/opt/service", "/", None, &out).expect("plan");
+        plan_copy_archive(&request(&tar, "app", "/opt/service", "/"), &out).expect("plan");
 
-        assert_eq!(plan.created_roots, vec!["/opt/service".to_string()]);
         let entries = rewritten_entries(&out);
         assert!(entries.contains_key("opt/service/"));
         assert!(entries.contains_key("opt/service/main.py"));
@@ -544,9 +623,8 @@ mod tests {
         );
         let out = dir.path().join("out.tar");
 
-        let plan = plan_copy_archive(&tar, ".", "/workspace", "/", None, &out).expect("plan");
+        plan_copy_archive(&request(&tar, ".", "/workspace", "/"), &out).expect("plan");
 
-        assert_eq!(plan.created_roots, vec!["/workspace".to_string()]);
         let entries = rewritten_entries(&out);
         assert!(entries.contains_key("workspace/a.txt"));
         assert!(entries.contains_key("workspace/sub/b.txt"));
@@ -561,16 +639,12 @@ mod tests {
         );
         let out = dir.path().join("out.tar");
 
-        let plan = plan_copy_archive(&tar, "*.txt", "/data/", "/", None, &out).expect("plan");
+        let plan = plan_copy_archive(&request(&tar, "*.txt", "/data/", "/"), &out).expect("plan");
 
         assert_eq!(plan.entry_count, 2);
         let entries = rewritten_entries(&out);
         assert!(entries.contains_key("data/one.txt"));
         assert!(entries.contains_key("data/two.txt"));
-        assert_eq!(
-            plan.created_roots,
-            vec!["/data/one.txt".to_string(), "/data/two.txt".to_string()]
-        );
     }
 
     #[test]
@@ -587,13 +661,11 @@ mod tests {
         );
         let out = dir.path().join("out.tar");
 
-        let plan = plan_copy_archive(&tar, "pkg-*", "/opt/pkgs", "/", None, &out).expect("plan");
+        plan_copy_archive(&request(&tar, "pkg-*", "/opt/pkgs", "/"), &out).expect("plan");
 
-        let entries = rewritten_entries(&out);
         // Docker merges contents of every matched directory into dest; the
         // second lib.py overwrites the first at extract time.
-        assert!(entries.contains_key("opt/pkgs/lib.py"));
-        assert_eq!(plan.created_roots, vec!["/opt/pkgs".to_string()]);
+        assert!(rewritten_entries(&out).contains_key("opt/pkgs/lib.py"));
     }
 
     #[test]
@@ -602,19 +674,35 @@ mod tests {
         let tar = build_source_tar(dir.path(), &[("run.sh", Some("#!/bin/sh\n"))]);
         let out = dir.path().join("out.tar");
 
-        plan_copy_archive(
-            &tar,
-            "run.sh",
-            "/usr/local/bin/run.sh",
-            "/",
-            Some(0o755),
-            &out,
-        )
-        .expect("plan");
+        let mut req = request(&tar, "run.sh", "/usr/local/bin/run.sh", "/");
+        req.mode = Some(0o755);
+        plan_copy_archive(&req, &out).expect("plan");
 
-        let entries = rewritten_entries(&out);
-        let (_, _, mode, _) = &entries["usr/local/bin/run.sh"];
-        assert_eq!(*mode, 0o755);
+        assert_eq!(rewritten_entries(&out)["usr/local/bin/run.sh"].mode, 0o755);
+    }
+
+    #[test]
+    fn ownership_is_written_into_entry_headers() {
+        let dir = TempDir::new().expect("tempdir");
+        let tar = build_source_tar(
+            dir.path(),
+            &[("app", None), ("app/main.py", Some("print()\n"))],
+        );
+        let out = dir.path().join("out.tar");
+
+        let mut req = request(&tar, "app", "/opt/service", "/");
+        req.ownership = Some(CopyOwnership {
+            uid: 1000,
+            gid: 2000,
+        });
+        plan_copy_archive(&req, &out).expect("plan");
+
+        // Every created entry carries the requested ownership, and nothing
+        // outside the archive can be affected.
+        for entry in rewritten_entries(&out).values() {
+            assert_eq!(entry.uid, 1000);
+            assert_eq!(entry.gid, 2000);
+        }
     }
 
     #[test]
@@ -630,9 +718,21 @@ mod tests {
         encoder.finish().expect("finish gz");
         let out = dir.path().join("out.tar");
 
-        let plan =
-            plan_copy_archive(&gz_path, "hello.txt", "/hello.txt", "/", None, &out).expect("plan");
+        let plan = plan_copy_archive(&request(&gz_path, "hello.txt", "/hello.txt", "/"), &out)
+            .expect("plan");
         assert_eq!(plan.entry_count, 1);
+    }
+
+    #[test]
+    fn rejects_archives_over_the_decompressed_budget() {
+        let dir = TempDir::new().expect("tempdir");
+        let tar = build_source_tar(dir.path(), &[("big.txt", Some("0123456789"))]);
+        let out = dir.path().join("out.tar");
+
+        let mut req = request(&tar, "big.txt", "/big.txt", "/");
+        req.max_total_bytes = 4;
+        let err = plan_copy_archive(&req, &out).expect_err("oversized archive must fail");
+        assert!(err.to_string().contains("expands beyond"));
     }
 
     #[test]
@@ -656,7 +756,7 @@ mod tests {
         builder.finish().expect("finish");
         let out = dir.path().join("out.tar");
 
-        let err = plan_copy_archive(&tar_path, "passwd", "/tmp/x", "/", None, &out)
+        let err = plan_copy_archive(&request(&tar_path, "passwd", "/tmp/x", "/"), &out)
             .expect_err("path escape must fail");
         assert!(err.to_string().contains("unsupported path component"));
     }
@@ -667,7 +767,7 @@ mod tests {
         let tar = build_source_tar(dir.path(), &[("a.txt", Some("a"))]);
         let out = dir.path().join("out.tar");
 
-        let err = plan_copy_archive(&tar, "a.txt", "../../x", "/", None, &out)
+        let err = plan_copy_archive(&request(&tar, "a.txt", "../../x", "/"), &out)
             .expect_err("dest escape must fail");
         assert!(err.to_string().contains("escapes the filesystem root"));
     }
@@ -680,9 +780,28 @@ mod tests {
         tar::Builder::new(file).finish().expect("finish");
         let out = dir.path().join("out.tar");
 
-        let err = plan_copy_archive(&tar_path, "x", "/x", "/", None, &out)
+        let err = plan_copy_archive(&request(&tar_path, "x", "/x", "/"), &out)
             .expect_err("empty archive must fail");
         assert!(err.to_string().contains("no files"));
+    }
+
+    #[test]
+    fn guest_path_resolution_follows_docker_semantics() {
+        assert_eq!(
+            resolve_guest_path("/srv", "app").expect("relative"),
+            "/srv/app"
+        );
+        assert_eq!(
+            resolve_guest_path("/srv/app", "/opt").expect("absolute"),
+            "/opt"
+        );
+        assert_eq!(
+            resolve_guest_path("/srv/app", "../lib").expect("parent"),
+            "/srv/lib"
+        );
+        assert_eq!(resolve_guest_path("", "opt").expect("empty base"), "/opt");
+        assert!(resolve_guest_path("relative", "app").is_err());
+        assert!(resolve_guest_path("/", "../escape").is_err());
     }
 
     #[test]

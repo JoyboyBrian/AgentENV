@@ -485,6 +485,11 @@ pub struct TemplateBuildConfig {
     /// Maximum accepted size for one uploaded build-context archive, in MiB.
     #[config(default = 1024u64)]
     pub files_max_upload_mib: u64,
+    /// Maximum size one build-context archive may expand to once
+    /// decompressed, in MiB. This bounds what a compressed upload can cost
+    /// the node that runs the build.
+    #[config(default = 4096u64)]
+    pub files_max_context_mib: u64,
     /// How long an issued upload URL stays valid, in seconds.
     #[config(default = 3600u64)]
     pub files_url_ttl_secs: u64,
