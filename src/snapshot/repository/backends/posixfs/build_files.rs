@@ -64,15 +64,39 @@ impl PosixFsTemplateBuildFileStore {
         Self::prune_dir_older_than(root, "tar", cutoff);
     }
 
-    /// Removes upload grants older than the retention window. Runs
+    /// Removes upload grants that have passed their own `expires_unix`. Runs
     /// opportunistically whenever a new grant is written, so the grants
     /// directory stays bounded by upload-link traffic; failures only log.
+    ///
+    /// Pruning by the record rather than by mtime keeps grants alive for
+    /// exactly their TTL even when `template_build.files_url_ttl_secs` is
+    /// configured beyond the retention window.
     fn prune_expired_grants(root: &Path) {
         let cutoff = SystemTime::now() - BUILD_FILE_RETENTION;
-        Self::prune_dir_older_than(&Self::grants_dir(root), "json", cutoff);
+        let now_unix = chrono::Utc::now().timestamp();
+        Self::prune_dir(&Self::grants_dir(root), "json", |path, modified| {
+            match fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<TemplateBuildUploadGrant>(&bytes).ok())
+            {
+                Some(grant) => grant.expires_unix < now_unix,
+                // Unparseable leftovers fall back to the mtime rule.
+                None => modified.is_some_and(|modified| modified < cutoff),
+            }
+        });
     }
 
     fn prune_dir_older_than(dir: &Path, extension: &str, cutoff: SystemTime) {
+        Self::prune_dir(dir, extension, |_, modified| {
+            modified.is_some_and(|modified| modified < cutoff)
+        });
+    }
+
+    fn prune_dir(
+        dir: &Path,
+        extension: &str,
+        is_expired: impl Fn(&Path, Option<SystemTime>) -> bool,
+    ) {
         let Ok(entries) = fs::read_dir(dir) else {
             return;
         };
@@ -81,12 +105,11 @@ impl PosixFsTemplateBuildFileStore {
             if path.extension().is_none_or(|ext| ext != extension) {
                 continue;
             }
-            let expired = entry
+            let modified = entry
                 .metadata()
                 .and_then(|metadata| metadata.modified())
-                .map(|modified| modified < cutoff)
-                .unwrap_or(false);
-            if expired {
+                .ok();
+            if is_expired(&path, modified) {
                 if let Err(error) = fs::remove_file(&path) {
                     warn!(
                         path = %path.display(),
@@ -106,6 +129,36 @@ impl PosixFsTemplateBuildFileStore {
 
     fn grant_path(root: &Path, token: &str) -> Option<PathBuf> {
         is_valid_upload_token(token).then(|| Self::grants_dir(root).join(format!("{token}.json")))
+    }
+
+    /// Reads a grant record, mapping an absent file to `None`.
+    fn read_grant(path: &Path) -> RepositoryResult<Option<TemplateBuildUploadGrant>> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(RepositoryError::backend("read upload grant", error)),
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| RepositoryError::backend("parse upload grant", error))
+    }
+
+    /// Best-effort mtime refresh, so retention means "unused for the window"
+    /// and an archive a build is still reading stays outside the prune
+    /// horizon. Read-only repository mounts must keep working, so failures
+    /// only log.
+    fn touch(path: &Path) {
+        let refreshed = fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_times(fs::FileTimes::new().set_modified(SystemTime::now())));
+        if let Err(error) = refreshed {
+            debug!(
+                path = %path.display(),
+                error = %error,
+                "failed to refresh build archive mtime"
+            );
+        }
     }
 
     fn write_grant(
@@ -161,9 +214,18 @@ impl PosixFsTemplateBuildFileStore {
 impl TemplateBuildFileStore for PosixFsTemplateBuildFileStore {
     async fn exists(&self, hash: &str) -> RepositoryResult<bool> {
         let path = self.archive_path(hash)?;
-        task::spawn_blocking(move || path.exists())
-            .await
-            .map_err(|error| RepositoryError::backend("join build file exists task", error))
+        task::spawn_blocking(move || -> RepositoryResult<bool> {
+            match fs::metadata(&path) {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(RepositoryError::backend(
+                    format!("stat build archive '{}'", path.display()),
+                    error,
+                )),
+            }
+        })
+        .await
+        .map_err(|error| RepositoryError::backend("join build file exists task", error))?
     }
 
     async fn import(&self, hash: &str, staged: &Path) -> RepositoryResult<()> {
@@ -179,17 +241,23 @@ impl TemplateBuildFileStore for PosixFsTemplateBuildFileStore {
             Self::ensure_root(&root)?;
             Self::prune_expired(&root);
             // Copy into the store filesystem first (the staged file usually
-            // lives on node-local tmp), then rename within the store directory
-            // so readers only ever observe complete archives.
+            // lives on node-local tmp), then link it into place within the
+            // store directory so readers only ever observe complete archives.
             let store_staged = root.join(format!(".import-{}.tmp", uuid::Uuid::new_v4()));
             fs::copy(&staged, &store_staged).map_err(|error| {
                 let _ = fs::remove_file(&store_staged);
                 RepositoryError::backend("copy build archive into store", error)
             })?;
-            fs::rename(&store_staged, &final_path).map_err(|error| {
-                let _ = fs::remove_file(&store_staged);
-                RepositoryError::backend("publish build archive", error)
-            })
+            // Link rather than rename so a concurrent import cannot replace an
+            // archive a running build is already reading: the first writer
+            // wins and everyone else observes `AlreadyExists`.
+            let published = match fs::hard_link(&store_staged, &final_path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                Err(error) => Err(RepositoryError::backend("publish build archive", error)),
+            };
+            let _ = fs::remove_file(&store_staged);
+            published
         })
         .await
         .map_err(|error| RepositoryError::backend("join build file import task", error))?
@@ -201,9 +269,21 @@ impl TemplateBuildFileStore for PosixFsTemplateBuildFileStore {
         _scratch_dir: &Path,
     ) -> RepositoryResult<Option<PathBuf>> {
         let path = self.archive_path(hash)?;
-        task::spawn_blocking(move || path.exists().then_some(path))
-            .await
-            .map_err(|error| RepositoryError::backend("join build file materialize task", error))
+        task::spawn_blocking(move || -> RepositoryResult<Option<PathBuf>> {
+            match fs::metadata(&path) {
+                Ok(_) => {
+                    Self::touch(&path);
+                    Ok(Some(path))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(RepositoryError::backend(
+                    format!("stat build archive '{}'", path.display()),
+                    error,
+                )),
+            }
+        })
+        .await
+        .map_err(|error| RepositoryError::backend("join build file materialize task", error))?
     }
 
     async fn create_upload_grant(
@@ -220,6 +300,31 @@ impl TemplateBuildFileStore for PosixFsTemplateBuildFileStore {
             .map_err(|error| RepositoryError::backend("join create upload grant task", error))?
     }
 
+    async fn verify_upload_grant(
+        &self,
+        token: &str,
+        template_id: &str,
+        hash: &str,
+        expires_unix: i64,
+        now_unix: i64,
+    ) -> RepositoryResult<bool> {
+        let Some(path) = Self::grant_path(&self.root, token) else {
+            return Ok(false);
+        };
+        let template_id = template_id.to_string();
+        let hash = hash.to_string();
+        task::spawn_blocking(move || -> RepositoryResult<bool> {
+            // Reads only: the grant file must survive so an upload that fails
+            // before the archive is stored can be retried with the same URL.
+            let Some(grant) = Self::read_grant(&path)? else {
+                return Ok(false);
+            };
+            Ok(grant.authorizes(&template_id, &hash, expires_unix, now_unix))
+        })
+        .await
+        .map_err(|error| RepositoryError::backend("join verify upload grant task", error))?
+    }
+
     async fn claim_upload_grant(
         &self,
         token: &str,
@@ -233,16 +338,10 @@ impl TemplateBuildFileStore for PosixFsTemplateBuildFileStore {
         };
         let template_id = template_id.to_string();
         let hash = hash.to_string();
-        task::spawn_blocking(move || {
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(error) => {
-                    return Err(RepositoryError::backend("read upload grant", error));
-                }
+        task::spawn_blocking(move || -> RepositoryResult<bool> {
+            let Some(grant) = Self::read_grant(&path)? else {
+                return Ok(false);
             };
-            let grant: TemplateBuildUploadGrant = serde_json::from_slice(&bytes)
-                .map_err(|error| RepositoryError::backend("parse upload grant", error))?;
             if !grant.authorizes(&template_id, &hash, expires_unix, now_unix) {
                 return Ok(false);
             }
@@ -422,6 +521,29 @@ mod tests {
             .await
             .expect("repeat import should be accepted");
 
+        // Two imports racing for a hash neither has stored yet must both
+        // succeed; the loser's hard link hits AlreadyExists and is dropped.
+        // A fresh hash keeps both calls off the exists() fast path.
+        const FRESH_HASH: &str = "f00ff00ff00ff00ff00ff00ff00ff00f";
+        let concurrent = tempdir.path().join("concurrent.tar");
+        fs::write(&concurrent, b"concurrent").expect("write concurrent");
+        let (left, right) = tokio::join!(
+            store.import(FRESH_HASH, &replacement),
+            store.import(FRESH_HASH, &concurrent)
+        );
+        left.expect("concurrent import should be accepted");
+        right.expect("concurrent import should be accepted");
+        let winner = store
+            .materialize(FRESH_HASH, tempdir.path())
+            .await
+            .expect("materialize should work")
+            .expect("archive should exist");
+        let winner_bytes = fs::read(winner).expect("read winner");
+        assert!(
+            winner_bytes == b"replaced" || winner_bytes == b"concurrent",
+            "stored bytes must come from one of the racing imports"
+        );
+
         let materialized = store
             .materialize(HASH, tempdir.path())
             .await
@@ -431,6 +553,139 @@ mod tests {
             fs::read(materialized).expect("read materialized"),
             b"original",
             "a stored archive must never be replaced underneath a build"
+        );
+
+        let leftovers = fs::read_dir(tempdir.path().join("template-build-files"))
+            .expect("read store dir")
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".import-"))
+            .count();
+        assert_eq!(leftovers, 0, "import must not leak staging files");
+    }
+
+    #[tokio::test]
+    async fn materialize_refreshes_the_archive_mtime() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let store = PosixFsTemplateBuildFileStore::new(tempdir.path());
+
+        let staged = staged_file(tempdir.path(), b"tar-bytes");
+        store.import(HASH, &staged).await.expect("import");
+
+        let archive = tempdir
+            .path()
+            .join("template-build-files")
+            .join(format!("{HASH}.tar"));
+        let stale = SystemTime::now() - BUILD_FILE_RETENTION - Duration::from_secs(60);
+        let file = fs::File::options()
+            .write(true)
+            .open(&archive)
+            .expect("open archive");
+        file.set_times(fs::FileTimes::new().set_modified(stale))
+            .expect("set stale mtime");
+        drop(file);
+
+        store
+            .materialize(HASH, tempdir.path())
+            .await
+            .expect("materialize should work")
+            .expect("archive should exist");
+
+        let modified = fs::metadata(&archive)
+            .and_then(|metadata| metadata.modified())
+            .expect("read archive mtime");
+        assert!(
+            modified > stale,
+            "materializing an archive must keep it outside the prune horizon"
+        );
+    }
+
+    #[tokio::test]
+    async fn verifying_a_grant_does_not_consume_it() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let store = PosixFsTemplateBuildFileStore::new(tempdir.path());
+        let token = store
+            .create_upload_grant("template", HASH, 1000)
+            .await
+            .expect("grant should be created");
+
+        for _ in 0..2 {
+            assert!(
+                store
+                    .verify_upload_grant(&token, "template", HASH, 1000, 999)
+                    .await
+                    .expect("verification should work"),
+                "verification must not consume the grant"
+            );
+        }
+        assert!(!store
+            .verify_upload_grant(&token, "other", HASH, 1000, 999)
+            .await
+            .expect("mismatched grant should be rejected"));
+
+        // An upload that failed after verification can still be retried.
+        assert!(store
+            .claim_upload_grant(&token, "template", HASH, 1000, 999)
+            .await
+            .expect("claim should succeed"));
+        assert!(
+            !store
+                .verify_upload_grant(&token, "template", HASH, 1000, 999)
+                .await
+                .expect("verification should work"),
+            "a consumed grant must no longer verify"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_claims_pick_a_single_winner() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let store = PosixFsTemplateBuildFileStore::new(tempdir.path());
+        let token = store
+            .create_upload_grant("template", HASH, 1000)
+            .await
+            .expect("grant should be created");
+
+        let (left, right) = tokio::join!(
+            store.claim_upload_grant(&token, "template", HASH, 1000, 999),
+            store.claim_upload_grant(&token, "template", HASH, 1000, 999)
+        );
+        let claims = [
+            left.expect("claim should work"),
+            right.expect("claim should work"),
+        ];
+        assert_eq!(
+            claims.iter().filter(|claimed| **claimed).count(),
+            1,
+            "exactly one concurrent claim may win"
+        );
+    }
+
+    #[tokio::test]
+    async fn grants_are_pruned_once_their_own_expiry_passes() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let store = PosixFsTemplateBuildFileStore::new(tempdir.path());
+
+        // Expired long ago in grant terms, but freshly written on disk, so the
+        // mtime rule alone would keep it for the whole retention window.
+        let expired_token = store
+            .create_upload_grant("template", HASH, 1000)
+            .await
+            .expect("grant should be created");
+        let expired_path = tempdir
+            .path()
+            .join("template-build-files")
+            .join("upload-grants")
+            .join(format!("{expired_token}.json"));
+        assert!(expired_path.exists());
+
+        store
+            .create_upload_grant("template", HASH, i64::MAX)
+            .await
+            .expect("new grant should be created");
+
+        assert!(
+            !expired_path.exists(),
+            "a grant past its own expiry should be pruned"
         );
     }
 }

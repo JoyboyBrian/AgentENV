@@ -6,6 +6,8 @@
 //! therefore the credential, and this route stays outside the generated
 //! router so the archive can stream to disk instead of buffering in memory.
 
+use std::time::Duration;
+
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -92,15 +94,16 @@ where
         );
     };
 
-    // Claiming consumes the grant, so an upload URL works exactly once.
+    // Verification does not consume the grant, so an upload that fails before
+    // the archive is stored can be retried with the same URL.
     let now_unix = chrono::Utc::now().timestamp();
     let authorized = match store
-        .claim_upload_grant(&query.token, &template_id, &hash, query.expires, now_unix)
+        .verify_upload_grant(&query.token, &template_id, &hash, query.expires, now_unix)
         .await
     {
         Ok(authorized) => authorized,
         Err(error) => {
-            warn!(error = %error, "failed to claim build-file upload grant");
+            warn!(error = %error, "failed to verify build-file upload grant");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to validate upload grant",
@@ -118,11 +121,25 @@ where
         .template_build
         .files_max_upload_mib
         .saturating_mul(1024 * 1024);
+    let upload_timeout = Duration::from_secs(
+        ConfigManager::global_config()
+            .template_build
+            .files_upload_timeout_secs,
+    );
 
-    let staged = match tempfile::NamedTempFile::new() {
-        Ok(staged) => staged,
-        Err(error) => {
+    // `staged` is the drop guard that removes the staging file on every early
+    // return below, so it must stay bound for the rest of the handler.
+    let staged = match tokio::task::spawn_blocking(tempfile::NamedTempFile::new).await {
+        Ok(Ok(staged)) => staged,
+        Ok(Err(error)) => {
             warn!(error = %error, "failed to create staging file for build archive");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to stage build archive",
+            );
+        }
+        Err(error) => {
+            warn!(error = %error, "failed to join staging file creation for build archive");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to stage build archive",
@@ -142,43 +159,87 @@ where
         }
     };
 
-    let mut total: u64 = 0;
-    let mut stream = request.into_body().into_data_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                debug!(error = %error, "build archive upload stream aborted");
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "failed to read the uploaded archive body",
-                );
+    let consume_body = async {
+        let mut total: u64 = 0;
+        let mut stream = request.into_body().into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    debug!(error = %error, "build archive upload stream aborted");
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "failed to read the uploaded archive body",
+                    ));
+                }
+            };
+            total += chunk.len() as u64;
+            if total > max_bytes {
+                return Err(error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("build archive exceeds the configured limit of {max_bytes} bytes"),
+                ));
             }
-        };
-        total += chunk.len() as u64;
-        if total > max_bytes {
-            return error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("build archive exceeds the configured limit of {max_bytes} bytes"),
-            );
+            if let Err(error) = file.write_all(&chunk).await {
+                warn!(error = %error, "failed to write staged build archive");
+                return Err(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to stage build archive",
+                ));
+            }
         }
-        if let Err(error) = file.write_all(&chunk).await {
-            warn!(error = %error, "failed to write staged build archive");
-            return error_response(
+        if let Err(error) = file.flush().await {
+            warn!(error = %error, "failed to flush staged build archive");
+            return Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to stage build archive",
+            ));
+        }
+        Ok(total)
+    };
+
+    let total = match tokio::time::timeout(upload_timeout, consume_body).await {
+        Ok(Ok(total)) => total,
+        Ok(Err(response)) => return response,
+        Err(_) => {
+            debug!(template_id, hash, "build archive upload timed out");
+            return error_response(
+                StatusCode::REQUEST_TIMEOUT,
+                format!(
+                    "build archive upload did not complete within {} seconds",
+                    upload_timeout.as_secs()
+                ),
             );
         }
-    }
-    if let Err(error) = file.flush().await {
-        warn!(error = %error, "failed to flush staged build archive");
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to stage build archive",
-        );
-    }
+    };
     drop(file);
 
+    // Consuming the grant here keeps a failed upload retryable while the
+    // atomic remove/delete still picks a single winner among concurrent
+    // replays. `now_unix` is the timestamp taken before the body was read, so
+    // a slow but authorized upload is not rejected for aging past the TTL.
+    let claimed = match store
+        .claim_upload_grant(&query.token, &template_id, &hash, query.expires, now_unix)
+        .await
+    {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            warn!(error = %error, "failed to claim build-file upload grant");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to validate upload grant",
+            );
+        }
+    };
+    if !claimed {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "upload grant is invalid, expired, or already used; request a fresh upload link",
+        );
+    }
+
+    // `hash` is the cache key the SDK computed for this build context, not a
+    // digest of the received bytes that the server verified.
     if let Err(error) = store.import(&hash, &staged_path).await {
         warn!(error = %error, hash, "failed to import build archive");
         return error_response(

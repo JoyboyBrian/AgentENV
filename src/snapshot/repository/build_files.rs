@@ -66,10 +66,12 @@ pub trait TemplateBuildFileStore: Send + Sync {
     /// Imports a fully written local file as the archive for `hash`.
     ///
     /// Implementations must publish atomically: concurrent readers never
-    /// observe a partially imported archive. Archives are content-addressed
-    /// and therefore immutable — importing a hash that is already stored
-    /// keeps the stored archive, so an in-flight build can never observe its
-    /// build context change underneath it.
+    /// observe a partially imported archive. `hash` is the cache key supplied
+    /// by the authenticated caller, not a digest the store verifies, so
+    /// immutability here means first-write-wins stability rather than content
+    /// authenticity: importing a hash that is already stored keeps the stored
+    /// archive, so an in-flight build can never observe its build context
+    /// change underneath it.
     async fn import(&self, hash: &str, staged: &Path) -> RepositoryResult<()>;
 
     /// Materializes the archive for `hash` as a node-local file.
@@ -93,13 +95,33 @@ pub trait TemplateBuildFileStore: Send + Sync {
         expires_unix: i64,
     ) -> RepositoryResult<String>;
 
+    /// Verifies a durable bearer grant without consuming it, returning
+    /// whether it authorizes this upload.
+    ///
+    /// Verification never removes the grant, so a request that fails before
+    /// the archive is stored can be retried with the same upload URL. Callers
+    /// must still `claim_upload_grant` before publishing the archive.
+    async fn verify_upload_grant(
+        &self,
+        token: &str,
+        template_id: &str,
+        hash: &str,
+        expires_unix: i64,
+        now_unix: i64,
+    ) -> RepositoryResult<bool>;
+
     /// Claims a durable bearer grant, returning whether it authorized this
     /// upload.
     ///
     /// Grants are single-use: a successful claim consumes the grant, so an
     /// upload URL cannot be replayed within its TTL. Implementations must
-    /// make the claim itself the atomic step, so concurrent requests carrying
-    /// the same token cannot both succeed.
+    /// make the claim itself the atomic step wherever the backend offers an
+    /// atomic primitive (a POSIX filesystem does, via rename/unlink), so
+    /// concurrent requests carrying the same token cannot both succeed.
+    /// S3-compatible backends have no conditional delete and therefore
+    /// degrade to best-effort single-use within the grant TTL; archive
+    /// immutability is what keeps a lost race from mattering, since the
+    /// competing uploads can only publish the same content-addressed archive.
     async fn claim_upload_grant(
         &self,
         token: &str,

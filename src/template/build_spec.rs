@@ -230,10 +230,11 @@ impl TemplateBuildSpec {
 
     /// Returns the distinct build-context archive hashes referenced by COPY steps.
     pub(crate) fn referenced_build_file_hashes(steps: &[TemplateBuildStep]) -> Vec<String> {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut hashes: Vec<String> = Vec::new();
         for step in steps {
             if let TemplateBuildStepKind::Copy { files_hash, .. } = &step.kind {
-                if !hashes.iter().any(|existing| existing == files_hash) {
+                if seen.insert(files_hash.as_str()) {
                     hashes.push(files_hash.clone());
                 }
             }

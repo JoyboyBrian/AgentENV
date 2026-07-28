@@ -2024,6 +2024,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            content_type.starts_with("application/json"),
+            "unexpected content-type: {content_type}"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["code"], 404);
+        let message = payload["message"].as_str().unwrap();
+        assert!(
+            message.contains("route not found: GET /nonexistent/path"),
+            "unexpected message: {message}"
+        );
     }
 
     #[tokio::test]

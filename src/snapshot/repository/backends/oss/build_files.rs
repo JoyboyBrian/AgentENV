@@ -39,6 +39,18 @@ impl OssTemplateBuildFileStore {
         is_valid_upload_token(token)
             .then(|| format!("{BUILD_FILES_PREFIX}/upload-grants/{token}.json"))
     }
+
+    /// Reads a grant record, mapping an absent object to `None`.
+    async fn read_grant(&self, key: &str) -> RepositoryResult<Option<TemplateBuildUploadGrant>> {
+        let bytes = match self.client.get_bytes(key).await {
+            Ok(bytes) => bytes,
+            Err(error) if OssClient::is_not_found_error(&error) => return Ok(None),
+            Err(error) => return Err(RepositoryError::backend("read upload grant", error)),
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| RepositoryError::backend("parse upload grant", error))
+    }
 }
 
 #[async_trait]
@@ -53,8 +65,12 @@ impl TemplateBuildFileStore for OssTemplateBuildFileStore {
 
     async fn import(&self, hash: &str, staged: &Path) -> RepositoryResult<()> {
         let key = Self::archive_key(hash)?;
-        // Archives are immutable: the hash addresses the content, so a repeat
-        // upload cannot change what an in-flight build reads.
+        // Archives are immutable so a repeat upload cannot change what an
+        // in-flight build reads. This fast path is not atomic against a
+        // concurrent import: the loser's bytes are dropped, and since the hash
+        // is a caller-supplied cache key rather than a verified digest, which
+        // racing upload wins is undefined — first-write-wins stability, not
+        // content authenticity.
         if self
             .client
             .exists(&key)
@@ -75,20 +91,12 @@ impl TemplateBuildFileStore for OssTemplateBuildFileStore {
         scratch_dir: &Path,
     ) -> RepositoryResult<Option<PathBuf>> {
         let key = Self::archive_key(hash)?;
-        if !self
-            .client
-            .exists(&key)
-            .await
-            .map_err(|error| RepositoryError::backend("check build archive", error))?
-        {
-            return Ok(None);
-        }
         let dest = scratch_dir.join(format!("{hash}.tar"));
-        self.client
-            .get_to_file(&key, &dest)
-            .await
-            .map_err(|error| RepositoryError::backend("download build archive", error))?;
-        Ok(Some(dest))
+        match self.client.get_to_file(&key, &dest).await {
+            Ok(_) => Ok(Some(dest)),
+            Err(error) if OssClient::is_not_found_error(&error) => Ok(None),
+            Err(error) => Err(RepositoryError::backend("download build archive", error)),
+        }
     }
 
     async fn create_upload_grant(
@@ -112,6 +120,25 @@ impl TemplateBuildFileStore for OssTemplateBuildFileStore {
         Ok(token)
     }
 
+    async fn verify_upload_grant(
+        &self,
+        token: &str,
+        template_id: &str,
+        hash: &str,
+        expires_unix: i64,
+        now_unix: i64,
+    ) -> RepositoryResult<bool> {
+        let Some(key) = Self::grant_key(token) else {
+            return Ok(false);
+        };
+        // Deliberately does not delete the object: verification must leave the
+        // upload URL usable for a retry.
+        let Some(grant) = self.read_grant(&key).await? else {
+            return Ok(false);
+        };
+        Ok(grant.authorizes(template_id, hash, expires_unix, now_unix))
+    }
+
     async fn claim_upload_grant(
         &self,
         token: &str,
@@ -123,13 +150,9 @@ impl TemplateBuildFileStore for OssTemplateBuildFileStore {
         let Some(key) = Self::grant_key(token) else {
             return Ok(false);
         };
-        let bytes = match self.client.get_bytes(&key).await {
-            Ok(bytes) => bytes,
-            Err(error) if OssClient::is_not_found_error(&error) => return Ok(false),
-            Err(error) => return Err(RepositoryError::backend("read upload grant", error)),
+        let Some(grant) = self.read_grant(&key).await? else {
+            return Ok(false);
         };
-        let grant: TemplateBuildUploadGrant = serde_json::from_slice(&bytes)
-            .map_err(|error| RepositoryError::backend("parse upload grant", error))?;
         if !grant.authorizes(template_id, hash, expires_unix, now_unix) {
             return Ok(false);
         }

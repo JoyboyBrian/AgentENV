@@ -8,10 +8,15 @@
 //!
 //! The rewrite runs in two passes so an archive is never held in memory: the
 //! first pass indexes entry paths to compute the mapping, the second streams
-//! each entry's bytes straight into the rewritten archive.
+//! each entry's bytes straight into the rewritten archive. Both passes read
+//! from a single open file handle so the source cannot be replaced or unlinked
+//! between them.
 //!
 //! Ownership is written into the rewritten headers rather than applied with a
 //! post-extract `chown`, so a copy can only ever change the files it creates.
+//! For the same reason the destination root itself never gets an archive
+//! entry: `tar -xp` restores mode and ownership onto directory members that
+//! already exist.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
@@ -54,6 +59,16 @@ pub(crate) struct CopyPlan {
     pub(crate) entry_count: usize,
     /// Total file bytes written to the rewritten archive.
     pub(crate) total_bytes: u64,
+    /// Resolved absolute guest path of the copy destination root.
+    pub(crate) dest_root: String,
+    /// Whether a directory entry for `dest_root` itself was dropped. When set,
+    /// the guest has to create that directory (with the requested ownership
+    /// and mode) before extraction, but only if it does not already exist.
+    pub(crate) skipped_dest_root: bool,
+    /// Whether the copy treats `dest_root` as a directory. Archives without a
+    /// directory member for the root (file-only uploads) still need the guest
+    /// to create a missing destination with the requested metadata.
+    pub(crate) dest_is_dir: bool,
 }
 
 /// One archive entry as seen by the indexing pass.
@@ -67,55 +82,147 @@ fn is_glob_pattern(src: &str) -> bool {
     src.contains(['*', '?', '['])
 }
 
-/// Minimal fnmatch-style matcher covering `*`, `?` and `[...]` (no `**`),
-/// mirroring the Python `glob` patterns the SDK resolves client-side.
-fn glob_match(pattern: &str, value: &str) -> bool {
-    fn inner(pattern: &[char], value: &[char]) -> bool {
-        match pattern.split_first() {
-            None => value.is_empty(),
-            Some(('*', rest)) => (0..=value.len()).any(|skip| inner(rest, &value[skip..])),
-            Some(('?', rest)) => !value.is_empty() && inner(rest, &value[1..]),
-            Some(('[', rest)) => {
-                let Some(end) = rest.iter().position(|&c| c == ']') else {
-                    // No closing bracket: treat '[' as a literal character.
-                    return !value.is_empty() && value[0] == '[' && inner(rest, &value[1..]);
-                };
-                let (class, after) = rest.split_at(end);
-                let after = &after[1..];
-                let Some(&first) = value.first() else {
-                    return false;
-                };
-                let (negated, class) = match class.first() {
-                    Some('!') | Some('^') => (true, &class[1..]),
-                    _ => (false, class),
-                };
-                let mut matched = false;
-                let mut i = 0;
-                while i < class.len() {
-                    if i + 2 < class.len() && class[i + 1] == '-' {
-                        if class[i] <= first && first <= class[i + 2] {
-                            matched = true;
-                        }
-                        i += 3;
-                    } else {
-                        if class[i] == first {
-                            matched = true;
-                        }
-                        i += 1;
-                    }
-                }
-                if matched != negated {
-                    inner(after, &value[1..])
-                } else {
-                    false
-                }
+/// One member of a `[...]` character class.
+enum ClassItem {
+    Char(char),
+    Range(char, char),
+}
+
+/// One matchable unit inside a single path segment of a glob pattern.
+enum GlobToken {
+    Star,
+    Any,
+    Literal(char),
+    Class {
+        negated: bool,
+        items: Vec<ClassItem>,
+    },
+}
+
+/// Splits one pattern segment into tokens. An unterminated `[` is a literal.
+fn tokenize_segment(pattern: &[char]) -> Vec<GlobToken> {
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < pattern.len() {
+        match pattern[i] {
+            '*' => {
+                tokens.push(GlobToken::Star);
+                i += 1;
             }
-            Some((&c, rest)) => !value.is_empty() && value[0] == c && inner(rest, &value[1..]),
+            '?' => {
+                tokens.push(GlobToken::Any);
+                i += 1;
+            }
+            '[' => match pattern[i + 1..].iter().position(|&c| c == ']') {
+                None => {
+                    tokens.push(GlobToken::Literal('['));
+                    i += 1;
+                }
+                Some(end) => {
+                    let class = &pattern[i + 1..i + 1 + end];
+                    let (negated, class) = match class.first() {
+                        Some('!') | Some('^') => (true, &class[1..]),
+                        _ => (false, class),
+                    };
+                    let mut items = Vec::new();
+                    let mut j = 0;
+                    while j < class.len() {
+                        if j + 2 < class.len() && class[j + 1] == '-' {
+                            items.push(ClassItem::Range(class[j], class[j + 2]));
+                            j += 3;
+                        } else {
+                            items.push(ClassItem::Char(class[j]));
+                            j += 1;
+                        }
+                    }
+                    tokens.push(GlobToken::Class { negated, items });
+                    i += end + 2;
+                }
+            },
+            c => {
+                tokens.push(GlobToken::Literal(c));
+                i += 1;
+            }
         }
     }
-    let pattern: Vec<char> = pattern.chars().collect();
-    let value: Vec<char> = value.chars().collect();
-    inner(&pattern, &value)
+    tokens
+}
+
+/// Whether a single-character token accepts `c`.
+fn token_matches(token: &GlobToken, c: char) -> bool {
+    match token {
+        GlobToken::Star => false,
+        GlobToken::Any => true,
+        GlobToken::Literal(expected) => *expected == c,
+        GlobToken::Class { negated, items } => {
+            let hit = items.iter().any(|item| match item {
+                ClassItem::Char(ch) => *ch == c,
+                ClassItem::Range(low, high) => *low <= c && c <= *high,
+            });
+            hit != *negated
+        }
+    }
+}
+
+/// Matches one segment with a single backtrack point per `*`, which keeps the
+/// worst case quadratic instead of the exponential blowup a naive recursive
+/// matcher has on patterns such as `*a*a*a*a*b`.
+fn match_segment(tokens: &[GlobToken], value: &[char]) -> bool {
+    let mut token_idx = 0usize;
+    let mut value_idx = 0usize;
+    let mut last_star: Option<usize> = None;
+    let mut last_star_value = 0usize;
+
+    while value_idx < value.len() {
+        if token_idx < tokens.len() {
+            if matches!(tokens[token_idx], GlobToken::Star) {
+                last_star = Some(token_idx);
+                last_star_value = value_idx;
+                token_idx += 1;
+                continue;
+            }
+            if token_matches(&tokens[token_idx], value[value_idx]) {
+                token_idx += 1;
+                value_idx += 1;
+                continue;
+            }
+        }
+        // Mismatch: let the most recent `*` swallow one more character.
+        let Some(star_idx) = last_star else {
+            return false;
+        };
+        token_idx = star_idx + 1;
+        last_star_value += 1;
+        value_idx = last_star_value;
+    }
+
+    tokens[token_idx..]
+        .iter()
+        .all(|token| matches!(token, GlobToken::Star))
+}
+
+/// Minimal fnmatch-style matcher covering `*`, `?` and `[...]` (no `**`),
+/// mirroring the Python `glob` patterns the SDK resolves client-side.
+///
+/// Matching is segment-wise like Go's `path/filepath.Match`, which is what
+/// Docker uses for `COPY` sources: none of the wildcards ever match `/`, so a
+/// pattern and a value with different segment counts never match.
+fn glob_match(pattern: &str, value: &str) -> bool {
+    let mut pattern_segments = pattern.split('/');
+    let mut value_segments = value.split('/');
+    loop {
+        match (pattern_segments.next(), value_segments.next()) {
+            (None, None) => return true,
+            (Some(pattern_segment), Some(value_segment)) => {
+                let pattern_segment: Vec<char> = pattern_segment.chars().collect();
+                let value_segment: Vec<char> = value_segment.chars().collect();
+                if !match_segment(&tokenize_segment(&pattern_segment), &value_segment) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// Normalizes a context-relative source pattern ("./a/b/" -> "a/b").
@@ -176,7 +283,15 @@ fn normalize_entry_path(raw: &Path) -> Result<String> {
     for component in raw.components() {
         match component {
             std::path::Component::Normal(part) => {
-                parts.push(part.to_string_lossy().into_owned());
+                // Lossy conversion would collapse distinct non-UTF-8 names
+                // onto one replacement-character name, silently overwriting.
+                let Some(part) = part.to_str() else {
+                    bail!(
+                        "non-UTF-8 path component in archive entry '{}'",
+                        raw.display()
+                    );
+                };
+                parts.push(part.to_string());
             }
             std::path::Component::CurDir => {}
             other => bail!(
@@ -192,24 +307,67 @@ fn normalize_entry_path(raw: &Path) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-/// Opens the uploaded archive, transparently decompressing gzip.
-fn open_archive(source_tar: &Path) -> Result<tar::Archive<Box<dyn Read>>> {
-    let mut file = File::open(source_tar)
-        .with_context(|| format!("open build context archive '{}'", source_tar.display()))?;
-    let mut magic = [0u8; 2];
-    let gzip = match file.read(&mut magic) {
-        Ok(2) => magic == [0x1f, 0x8b],
-        _ => false,
-    };
-    file.seek(SeekFrom::Start(0))
-        .context("rewind build context archive")?;
+/// The uploaded archive, opened once and read twice.
+///
+/// Holding the handle across both passes means the two passes provably see the
+/// same inode: a concurrent unlink or replacement of the path cannot make the
+/// second pass read a different archive than the one the mapping was built
+/// from.
+struct SourceArchive {
+    file: File,
+    gzip: bool,
+    /// Hard cap on the bytes any one pass may pull out of the reader.
+    budget: u64,
+}
 
-    let reader: Box<dyn Read> = if gzip {
-        Box::new(flate2::read::GzDecoder::new(BufReader::new(file)))
-    } else {
-        Box::new(BufReader::new(file))
-    };
-    Ok(tar::Archive::new(reader))
+impl SourceArchive {
+    fn open(source_tar: &Path, max_total_bytes: u64) -> Result<Self> {
+        let mut file = File::open(source_tar)
+            .with_context(|| format!("open build context archive '{}'", source_tar.display()))?;
+        let mut magic = [0u8; 2];
+        let gzip = match file.read(&mut magic) {
+            Ok(2) => magic == [0x1f, 0x8b],
+            _ => false,
+        };
+        Ok(Self {
+            file,
+            gzip,
+            // The tar crate buffers GNU long-name and PAX records whole before
+            // any per-entry budget check can run, so the reader itself has to
+            // be capped. The slack covers per-entry framing for the maximum
+            // entry count on top of the caller's payload budget.
+            budget: max_total_bytes.saturating_add(MAX_ARCHIVE_ENTRIES as u64 * 1024),
+        })
+    }
+
+    /// Starts one pass over the archive from offset 0.
+    fn pass(&self) -> Result<tar::Archive<Box<dyn Read>>> {
+        let mut file = self
+            .file
+            .try_clone()
+            .context("reopen build context archive")?;
+        file.seek(SeekFrom::Start(0))
+            .context("rewind build context archive")?;
+
+        let reader: Box<dyn Read> = if self.gzip {
+            Box::new(flate2::read::GzDecoder::new(BufReader::new(file)).take(self.budget))
+        } else {
+            Box::new(BufReader::new(file).take(self.budget))
+        };
+        Ok(tar::Archive::new(reader))
+    }
+}
+
+/// Context for a per-entry read failure.
+///
+/// The reader is capped, so an entry that declares more bytes than the budget
+/// allows surfaces here as a truncated-archive error rather than an unbounded
+/// allocation; naming the limit keeps that case diagnosable.
+fn entry_read_context(max_total_bytes: u64) -> String {
+    format!(
+        "read build context archive entry; the archive must stay within the configured \
+         limit of {max_total_bytes} bytes"
+    )
 }
 
 fn check_entry_type(entry_type: tar::EntryType) -> Result<()> {
@@ -226,8 +384,8 @@ fn check_entry_type(entry_type: tar::EntryType) -> Result<()> {
 
 /// First pass: index entry paths and enforce the archive budgets without
 /// reading any file contents.
-fn read_entry_index(source_tar: &Path, max_total_bytes: u64) -> Result<Vec<EntryIndex>> {
-    let mut archive = open_archive(source_tar)?;
+fn read_entry_index(source: &SourceArchive, max_total_bytes: u64) -> Result<Vec<EntryIndex>> {
+    let mut archive = source.pass()?;
     let mut index = Vec::new();
     let mut total_bytes = 0u64;
 
@@ -235,11 +393,17 @@ fn read_entry_index(source_tar: &Path, max_total_bytes: u64) -> Result<Vec<Entry
         .entries()
         .context("read build context archive entries")?
     {
-        let entry = entry.context("read build context archive entry")?;
+        let entry = entry.with_context(|| entry_read_context(max_total_bytes))?;
         let entry_type = entry.header().entry_type();
         check_entry_type(entry_type)?;
 
-        total_bytes = total_bytes.saturating_add(entry.size());
+        // Count the entry's own header block and trailing padding: an archive
+        // of many empty files still costs real bytes to stream.
+        let padded_size = entry
+            .size()
+            .checked_next_multiple_of(512)
+            .unwrap_or(u64::MAX);
+        total_bytes = total_bytes.saturating_add(512).saturating_add(padded_size);
         if total_bytes > max_total_bytes {
             bail!(
                 "build context archive expands beyond the configured limit of \
@@ -262,23 +426,33 @@ fn read_entry_index(source_tar: &Path, max_total_bytes: u64) -> Result<Vec<Entry
     Ok(index)
 }
 
+/// Final guest paths for every indexed entry, plus what the guest still has to
+/// do for the destination root itself.
+struct MappedEntries {
+    /// Positionally aligned with the entry index; `None` marks an entry the
+    /// rewrite drops.
+    targets: Vec<Option<String>>,
+    /// Resolved absolute destination root.
+    dest_root: String,
+    /// Whether a directory entry for `dest_root` itself was dropped.
+    skipped_dest_root: bool,
+    /// Whether the copy treats `dest_root` as a directory.
+    dest_is_dir: bool,
+}
+
 /// Computes the final absolute guest path for every indexed entry.
-///
-/// The returned vector is positionally aligned with `index`.
 fn map_entries(
     index: &[EntryIndex],
     src: &str,
     dest_raw: &str,
     workdir: &str,
-) -> Result<Vec<String>> {
+) -> Result<MappedEntries> {
     let src = normalize_src(src);
     let dest_is_dir_hint = dest_raw.ends_with('/')
         || dest_raw.ends_with("/.")
         || dest_raw == "."
         || dest_raw.is_empty();
     let dest = resolve_guest_path(workdir, if dest_raw.is_empty() { "." } else { dest_raw })?;
-
-    let mut mapped = Vec::with_capacity(index.len());
 
     let copy_whole_context = src.is_empty() || src == ".";
     let single_file_src = !copy_whole_context
@@ -287,17 +461,15 @@ fn map_entries(
         && index[0].path == src
         && !index[0].is_dir;
 
-    if single_file_src {
-        mapped.push(if dest_is_dir_hint {
+    let mapped: Vec<String> = if single_file_src {
+        vec![if dest_is_dir_hint {
             join_abs(&dest, base_name(&src))
         } else {
-            dest
-        });
-        return Ok(mapped);
-    }
-
-    if copy_whole_context || !is_glob_pattern(&src) {
+            dest.clone()
+        }]
+    } else if copy_whole_context || !is_glob_pattern(&src) {
         // Directory source: Docker copies the directory *contents* into dest.
+        let mut mapped = Vec::with_capacity(index.len());
         for entry in index {
             let rel = if copy_whole_context {
                 entry.path.as_str()
@@ -314,54 +486,82 @@ fn map_entries(
             };
             mapped.push(join_abs(&dest, rel));
         }
-        return Ok(mapped);
-    }
-
-    // Glob source: every matched top-level item lands inside dest. Matched
-    // files keep their base name; matched directories contribute their
-    // contents (Docker treats each matched directory like a directory source).
-    for entry in index {
-        let mut components = entry.path.split('/');
-        let mut prefix = String::new();
-        let mut matched_root: Option<String> = None;
-        for component in components.by_ref() {
-            if prefix.is_empty() {
-                prefix.push_str(component);
+        mapped
+    } else {
+        // Glob source: every matched top-level item lands inside dest. Matched
+        // files keep their base name; matched directories contribute their
+        // contents (Docker treats each matched directory like a directory
+        // source).
+        let mut mapped = Vec::with_capacity(index.len());
+        for entry in index {
+            let mut components = entry.path.split('/');
+            let mut prefix = String::new();
+            let mut matched_root: Option<String> = None;
+            for component in components.by_ref() {
+                if prefix.is_empty() {
+                    prefix.push_str(component);
+                } else {
+                    prefix.push('/');
+                    prefix.push_str(component);
+                }
+                if glob_match(&src, &prefix) {
+                    matched_root = Some(prefix.clone());
+                    break;
+                }
+            }
+            let Some(root) = matched_root else {
+                bail!(
+                    "archive entry '{}' does not match COPY source pattern '{}'",
+                    entry.path,
+                    src
+                );
+            };
+            let rel = entry
+                .path
+                .strip_prefix(&root)
+                .map(|rest| rest.trim_start_matches('/'))
+                .unwrap_or("");
+            mapped.push(if rel.is_empty() && !entry.is_dir {
+                join_abs(&dest, base_name(&root))
             } else {
-                prefix.push('/');
-                prefix.push_str(component);
-            }
-            if glob_match(&src, &prefix) {
-                matched_root = Some(prefix.clone());
-                break;
-            }
+                join_abs(&dest, rel)
+            });
         }
-        let Some(root) = matched_root else {
-            bail!(
-                "archive entry '{}' does not match COPY source pattern '{}'",
-                entry.path,
-                src
-            );
-        };
-        let rel = entry
-            .path
-            .strip_prefix(&root)
-            .map(|rest| rest.trim_start_matches('/'))
-            .unwrap_or("");
-        mapped.push(if rel.is_empty() && !entry.is_dir {
-            join_abs(&dest, base_name(&root))
-        } else {
-            join_abs(&dest, rel)
-        });
-    }
-    Ok(mapped)
+        mapped
+    };
+
+    // A directory source (and every glob-matched directory) maps its own root
+    // onto dest. Emitting a header for it would make the guest's `tar -xp`
+    // restore mode and ownership onto a pre-existing destination directory,
+    // which a copy must never touch; the guest creates it instead when absent.
+    let mut skipped_dest_root = false;
+    let targets = mapped
+        .into_iter()
+        .zip(index)
+        .map(|(target, entry)| {
+            if entry.is_dir && target == dest {
+                skipped_dest_root = true;
+                None
+            } else {
+                Some(target)
+            }
+        })
+        .collect();
+
+    Ok(MappedEntries {
+        targets,
+        dest_root: dest,
+        skipped_dest_root,
+        dest_is_dir: !single_file_src,
+    })
 }
 
 /// Rewrites the SDK context archive into `output` with final absolute guest
 /// paths, the requested ownership, and the optional mode override applied.
 pub(crate) fn plan_copy_archive(request: &CopyRequest<'_>, output: &Path) -> Result<CopyPlan> {
-    let index = read_entry_index(request.source_tar, request.max_total_bytes)?;
-    let targets = map_entries(&index, request.src, request.dest, request.workdir)?;
+    let source = SourceArchive::open(request.source_tar, request.max_total_bytes)?;
+    let index = read_entry_index(&source, request.max_total_bytes)?;
+    let mapped = map_entries(&index, request.src, request.dest, request.workdir)?;
 
     let out_file = File::create(output)
         .with_context(|| format!("create rewritten copy archive '{}'", output.display()))?;
@@ -371,16 +571,19 @@ pub(crate) fn plan_copy_archive(request: &CopyRequest<'_>, output: &Path) -> Res
     let mut seen = 0usize;
 
     // Second pass: stream each entry's bytes into the rewritten archive.
-    let mut archive = open_archive(request.source_tar)?;
+    let mut archive = source.pass()?;
     for entry in archive
         .entries()
         .context("read build context archive entries")?
     {
-        let mut entry = entry.context("read build context archive entry")?;
-        let Some(target) = targets.get(seen) else {
+        let mut entry = entry.with_context(|| entry_read_context(request.max_total_bytes))?;
+        let Some(target) = mapped.targets.get(seen) else {
             bail!("build context archive changed while it was being rewritten");
         };
         seen += 1;
+        let Some(target) = target else {
+            continue;
+        };
 
         let relative = target.trim_start_matches('/');
         if relative.is_empty() {
@@ -441,7 +644,7 @@ pub(crate) fn plan_copy_archive(request: &CopyRequest<'_>, output: &Path) -> Res
         entry_count += 1;
     }
 
-    if seen != targets.len() {
+    if seen != mapped.targets.len() {
         bail!("build context archive changed while it was being rewritten");
     }
 
@@ -451,6 +654,9 @@ pub(crate) fn plan_copy_archive(request: &CopyRequest<'_>, output: &Path) -> Res
     Ok(CopyPlan {
         entry_count,
         total_bytes,
+        dest_root: mapped.dest_root,
+        skipped_dest_root: mapped.skipped_dest_root,
+        dest_is_dir: mapped.dest_is_dir,
     })
 }
 
@@ -556,6 +762,10 @@ mod tests {
 
         assert_eq!(plan.entry_count, 1);
         assert_eq!(plan.total_bytes, 6);
+        assert!(
+            !plan.dest_is_dir,
+            "a single-file dest needs no directory preparation"
+        );
         let entries = rewritten_entries(&out);
         let entry = &entries["hello.txt"];
         assert_eq!(entry.kind, tar::EntryType::Regular);
@@ -601,10 +811,20 @@ mod tests {
         );
         let out = dir.path().join("out.tar");
 
-        plan_copy_archive(&request(&tar, "app", "/opt/service", "/"), &out).expect("plan");
+        let plan =
+            plan_copy_archive(&request(&tar, "app", "/opt/service", "/"), &out).expect("plan");
 
+        assert_eq!(plan.dest_root, "/opt/service");
+        assert!(
+            plan.skipped_dest_root,
+            "the destination root must be left to the guest"
+        );
+        assert!(plan.dest_is_dir);
         let entries = rewritten_entries(&out);
-        assert!(entries.contains_key("opt/service/"));
+        assert!(
+            !entries.contains_key("opt/service/"),
+            "a header for the destination root would rewrite its metadata"
+        );
         assert!(entries.contains_key("opt/service/main.py"));
         assert!(entries.contains_key("opt/service/sub/"));
         assert!(entries.contains_key("opt/service/sub/util.py"));
@@ -661,11 +881,16 @@ mod tests {
         );
         let out = dir.path().join("out.tar");
 
-        plan_copy_archive(&request(&tar, "pkg-*", "/opt/pkgs", "/"), &out).expect("plan");
+        let plan =
+            plan_copy_archive(&request(&tar, "pkg-*", "/opt/pkgs", "/"), &out).expect("plan");
 
         // Docker merges contents of every matched directory into dest; the
         // second lib.py overwrites the first at extract time.
-        assert!(rewritten_entries(&out).contains_key("opt/pkgs/lib.py"));
+        let entries = rewritten_entries(&out);
+        assert!(entries.contains_key("opt/pkgs/lib.py"));
+        assert_eq!(plan.dest_root, "/opt/pkgs");
+        assert!(plan.skipped_dest_root);
+        assert!(!entries.contains_key("opt/pkgs/"));
     }
 
     #[test]
@@ -736,6 +961,58 @@ mod tests {
     }
 
     #[test]
+    fn rejects_truncated_long_name_records() {
+        let dir = TempDir::new().expect("tempdir");
+        let inner = build_source_tar(dir.path(), &[("small.txt", Some("s"))]);
+
+        // A GNU long-name record declaring far more bytes than it carries.
+        // The tar crate buffers such a record whole; the capped reader bounds
+        // that allocation and the overdeclared record fails as truncated
+        // instead of being served the rest of the stream as name bytes.
+        let mut header = tar::Header::new_gnu();
+        let long_link = b"././@LongLink";
+        header.as_gnu_mut().expect("gnu header").name[..long_link.len()].copy_from_slice(long_link);
+        header.set_entry_type(tar::EntryType::GNULongName);
+        header.set_mode(0o644);
+        header.set_size(0o77777777777);
+        header.set_cksum();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&[0u8; 512]);
+        bytes.extend_from_slice(&std::fs::read(&inner).expect("read inner tar"));
+        let tar_path = dir.path().join("longname.tar");
+        std::fs::write(&tar_path, &bytes).expect("write tar");
+        let out = dir.path().join("out.tar");
+
+        let mut req = request(&tar_path, "small.txt", "/small.txt", "/");
+        req.max_total_bytes = 64 * 1024;
+        let err = plan_copy_archive(&req, &out).expect_err("overdeclared long-name must fail");
+        assert!(err.to_string().contains("configured limit"));
+    }
+
+    #[test]
+    fn counts_entry_framing_against_the_budget() {
+        let dir = TempDir::new().expect("tempdir");
+        // Twenty empty files carry zero payload bytes but 512 bytes of tar
+        // framing each, which the index pass must charge to the budget.
+        let entries: Vec<(String, Option<&str>)> = (0..20)
+            .map(|i| (format!("empty-{i}.txt"), Some("")))
+            .collect();
+        let entries: Vec<(&str, Option<&str>)> = entries
+            .iter()
+            .map(|(name, content)| (name.as_str(), *content))
+            .collect();
+        let tar = build_source_tar(dir.path(), &entries);
+        let out = dir.path().join("out.tar");
+
+        let mut req = request(&tar, ".", "/ctx/", "/");
+        req.max_total_bytes = 4 * 1024;
+        let err = plan_copy_archive(&req, &out).expect_err("framing must exhaust the budget");
+        assert!(err.to_string().contains("expands beyond"));
+    }
+
+    #[test]
     fn rejects_entries_escaping_the_root() {
         let dir = TempDir::new().expect("tempdir");
         let tar_path = dir.path().join("evil.tar");
@@ -759,6 +1036,32 @@ mod tests {
         let err = plan_copy_archive(&request(&tar_path, "passwd", "/tmp/x", "/"), &out)
             .expect_err("path escape must fail");
         assert!(err.to_string().contains("unsupported path component"));
+    }
+
+    #[test]
+    fn rejects_non_utf8_entry_names() {
+        let dir = TempDir::new().expect("tempdir");
+        let tar_path = dir.path().join("latin1.tar");
+        let file = File::create(&tar_path).expect("create tar");
+        let mut builder = tar::Builder::new(file);
+        let mut header = tar::Header::new_gnu();
+        // A latin-1 name; lossy conversion would silently rename it and
+        // collapse distinct names onto one replacement-character path.
+        let raw_name = b"caf\xe9.txt";
+        header.as_gnu_mut().expect("gnu header").name[..raw_name.len()].copy_from_slice(raw_name);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(1);
+        header.set_cksum();
+        builder
+            .append(&header, "x".as_bytes())
+            .expect("append raw entry");
+        builder.finish().expect("finish");
+        let out = dir.path().join("out.tar");
+
+        let err = plan_copy_archive(&request(&tar_path, ".", "/ctx/", "/"), &out)
+            .expect_err("non-UTF-8 entry name must fail");
+        assert!(err.to_string().contains("non-UTF-8 path component"));
     }
 
     #[test]
@@ -812,5 +1115,25 @@ mod tests {
         assert!(glob_match("[ab]*", "b12"));
         assert!(!glob_match("[!ab]*", "b12"));
         assert!(glob_match("pkg-*", "pkg-a"));
+    }
+
+    #[test]
+    fn glob_wildcards_never_cross_a_separator() {
+        assert!(!glob_match("*.txt", "sub/a.txt"));
+        assert!(!glob_match("src?nested", "src/nested"));
+        assert!(!glob_match("[sa]rc", "src/nested"));
+        assert!(glob_match("src/*.rs", "src/main.rs"));
+        assert!(!glob_match("src/*.rs", "src/nested/main.rs"));
+        assert!(!glob_match("src/*", "src"));
+    }
+
+    #[test]
+    fn glob_match_stays_polynomial_on_pathological_patterns() {
+        // The previous recursive matcher took minutes on this input.
+        assert!(!glob_match("*a*a*a*a*a*a*a*a*b", &"a".repeat(64)));
+        assert!(glob_match(
+            "*a*a*a*a*a*a*a*a*b",
+            &format!("{}b", "a".repeat(64))
+        ));
     }
 }

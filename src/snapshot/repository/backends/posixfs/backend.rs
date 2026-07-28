@@ -529,6 +529,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_publish_keeps_previous_alias_and_removes_snapshot_dir() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let repository = test_backend(tempdir.path()).repository();
+
+        let first_id = SnapshotId::generate();
+        let local_artifacts = seed_built_snapshot(tempdir.path());
+        repository
+            .publish(
+                sample_metadata(first_id.clone(), Some("rebind")),
+                local_artifacts,
+            )
+            .await
+            .expect("first publish should work");
+
+        let second_id = SnapshotId::generate();
+        let broken_artifacts = seed_built_snapshot(tempdir.path());
+        // `import_built_artifacts` copies `vm_state.bin` first, so removing it
+        // fails the publish before any catalog state is committed.
+        fs::remove_file(&broken_artifacts.vm_state.path).expect("remove seeded vm state");
+        repository
+            .publish(
+                sample_metadata(second_id.clone(), Some("rebind")),
+                broken_artifacts,
+            )
+            .await
+            .expect_err("publish should fail when the vm state artifact is missing");
+
+        assert!(
+            !tempdir
+                .path()
+                .join("snapshots")
+                .join(second_id.to_string())
+                .exists(),
+            "failed publish should not leave a snapshot directory behind"
+        );
+
+        let resolved = repository
+            .resolve_alias("rebind")
+            .await
+            .expect("resolve should work")
+            .expect("alias should still resolve");
+        assert_eq!(
+            resolved, first_id,
+            "alias should stay bound to the previously committed snapshot"
+        );
+
+        let previous = repository
+            .get(first_id.to_string().as_str())
+            .await
+            .expect("get should work")
+            .expect("previous snapshot should stay addressable by id");
+        assert_eq!(
+            previous.alias.as_ref().map(ToString::to_string),
+            Some("rebind".to_string()),
+            "previous snapshot should keep the alias after a failed rebind"
+        );
+    }
+
+    #[tokio::test]
     async fn create_keeps_existing_alias_until_new_build_commits() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let repository = test_backend(tempdir.path()).repository();
