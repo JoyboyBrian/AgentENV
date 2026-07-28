@@ -99,8 +99,7 @@ sandbox.kill()
 
 ### Template builds
 
-The SDK's template builder works against AgentENV, including Dockerfiles with
-`COPY`:
+The SDK's template builder works against AgentENV, including Dockerfiles with `COPY`:
 
 ```python
 import asyncio
@@ -116,28 +115,14 @@ template = Template(file_context_path=".").from_dockerfile(
 asyncio.run(AsyncTemplate.build(template=template, alias="my-template"))
 ```
 
-How `COPY` works: for each `COPY` instruction the SDK requests an upload link
-(`GET /templates/{templateID}/files/{hash}`), `PUT`s a tar archive of the
-matching context files to the returned bearer upload URL, and references the
-archive by `filesHash` when it starts the build. AgentENV stores the archives
-in the snapshot repository (shared across nodes) and extracts them inside the
-build sandbox.
+How `COPY` works: for each `COPY` instruction the SDK requests an upload link (`GET /templates/{templateID}/files/{hash}`), `PUT`s a tar archive of the matching context files to the returned bearer upload URL, and references the archive by `filesHash` when it starts the build. AgentENV stores the archives in the snapshot repository (shared across nodes) and extracts them inside the build sandbox.
 
 Requirements and behavior notes:
 
-- The base image must provide `/bin/bash` (already required for `RUN` steps)
-  and `tar` for `COPY` steps.
-- Copied files are owned by `root:root` like Docker's `COPY` default;
-  `COPY --chown=user:group` is applied with `chown -R` after extraction, so
-  the user must exist in the image.
-- Write directory destinations with a trailing slash (`COPY app.py /opt/`).
-  Docker's special case of copying a single file onto an existing directory
-  named without a trailing slash (`COPY app.py /opt`) is not supported and
-  fails the build with a clear error.
-- Rebuilding an existing alias is allowed: the alias keeps pointing at the
-  previous template while the new build runs and moves to the new template
-  when the build commits (E2B semantics). The previous template stays
-  addressable by ID. A failed rebuild leaves the alias untouched.
+- The base image must provide `/bin/bash` (already required for `RUN` steps) and `tar` for `COPY` steps.
+- Copied files are owned by `root:root` like Docker's `COPY` default; `COPY --chown=user:group` is applied with `chown -R` after extraction, so the user must exist in the image.
+- Write directory destinations with a trailing slash (`COPY app.py /opt/`). Docker's special case of copying a single file onto an existing directory named without a trailing slash (`COPY app.py /opt`) is not supported and fails the build with a clear error.
+- Rebuilding an existing alias is allowed: the alias keeps pointing at the previous template while the new build runs and moves to the new template when the build commits (E2B semantics). The previous template stays addressable by ID. A failed rebuild leaves the alias untouched.
 
 ## E2B CLI
 
