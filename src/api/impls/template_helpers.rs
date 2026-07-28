@@ -128,17 +128,6 @@ fn apply_e2b_template_step(
     mut spec: TemplateBuildSpec,
     step: &models::TemplateStep,
 ) -> Result<TemplateBuildSpec, models::Error> {
-    if step
-        .files_hash
-        .as_ref()
-        .is_some_and(|hash| !hash.trim().is_empty())
-    {
-        return Err(models::Error::new(
-            400,
-            "template build filesHash/COPY support is not implemented yet".to_string(),
-        ));
-    }
-
     let args = step.args.as_deref().unwrap_or_default();
     match step.r_type.to_ascii_uppercase().as_str() {
         "RUN" => {
@@ -222,11 +211,68 @@ fn apply_e2b_template_step(
                 spec = spec.label(key.to_string(), pair[1].clone());
             }
         }
+        // The E2B SDK resolves ADD like COPY client-side (local files only)
+        // and sends both with a filesHash referencing the uploaded archive.
         "COPY" | "ADD" => {
-            return Err(models::Error::new(
-                400,
-                format!("{} template steps are not supported yet", step.r_type),
-            ));
+            let Some(files_hash) = step
+                .files_hash
+                .as_deref()
+                .map(str::trim)
+                .filter(|hash| !hash.is_empty())
+            else {
+                return Err(models::Error::new(
+                    400,
+                    format!(
+                        "{} template steps require a filesHash referencing an uploaded build context archive",
+                        step.r_type
+                    ),
+                ));
+            };
+            let src = args
+                .first()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    models::Error::new(
+                        400,
+                        format!("{} template step requires a source argument", step.r_type),
+                    )
+                })?;
+            let dest = args
+                .get(1)
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    models::Error::new(
+                        400,
+                        format!(
+                            "{} template step requires a destination argument",
+                            step.r_type
+                        ),
+                    )
+                })?;
+            let user = args
+                .get(2)
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let mode = args
+                .get(3)
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    u32::from_str_radix(value, 8).map_err(|_| {
+                        models::Error::new(
+                            400,
+                            format!(
+                                "{} template step mode '{value}' is not a valid octal mode",
+                                step.r_type
+                            ),
+                        )
+                    })
+                })
+                .transpose()?;
+            spec = spec.copy(src, dest, files_hash, user, mode);
         }
         other => {
             return Err(models::Error::new(

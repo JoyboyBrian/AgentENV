@@ -113,6 +113,8 @@ pub struct AppConfig {
     pub network: NetworkConfig,
     #[config(nested)]
     pub custom_extension: CustomExtensionConfig,
+    #[config(nested)]
+    pub template_build: TemplateBuildConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Config)]
@@ -473,6 +475,25 @@ pub struct CustomExtensionConfig {
     /// Timeout for custom extension HTTP calls, in milliseconds.
     #[config(default = 5000u64)]
     pub timeout_ms: u64,
+}
+
+/// Settings for the template build-context upload path used by the E2B SDK's
+/// `COPY` support (`GET /templates/{templateID}/files/{hash}` plus the upload
+/// URL it returns).
+#[derive(Debug, Config, Clone)]
+pub struct TemplateBuildConfig {
+    /// Maximum accepted size for one uploaded build-context archive, in MiB.
+    #[config(default = 1024u64)]
+    pub files_max_upload_mib: u64,
+    /// How long an issued upload URL stays valid, in seconds.
+    #[config(default = 3600u64)]
+    pub files_url_ttl_secs: u64,
+    /// Optional external base URL (e.g. "https://agentenv.example.com") used
+    /// when building upload URLs. When unset, upload URLs reuse the Host
+    /// header of the upload-link request with plain http, which matches
+    /// direct-node and bundled-gateway deployments.
+    #[config(env = "AENV_TEMPLATE_BUILD_PUBLIC_BASE_URL", parse_env = parse_trimmed_string)]
+    pub public_base_url: Option<String>,
 }
 
 #[derive(Debug, Config, Clone)]

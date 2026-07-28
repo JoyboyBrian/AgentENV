@@ -42,6 +42,7 @@ pub(crate) struct OssSnapshotRepository {
     client: Arc<OssClient>,
     snapshot_image_storage: SnapshotImageStoragePolicy,
     acr_exporter: AcrDiskImageExporter,
+    build_files: Arc<super::build_files::OssTemplateBuildFileStore>,
 }
 
 const MAX_ALIAS_BIND_ATTEMPTS: usize = 5;
@@ -51,10 +52,12 @@ impl OssSnapshotRepository {
         client: Arc<OssClient>,
         snapshot_image_storage: SnapshotImageStoragePolicy,
     ) -> Self {
+        let build_files = super::build_files::OssTemplateBuildFileStore::new(Arc::clone(&client));
         Self {
             client,
             snapshot_image_storage,
             acr_exporter: AcrDiskImageExporter::new(),
+            build_files,
         }
     }
 
@@ -148,6 +151,15 @@ fn fallback_to_object_storage_would_mix_sources(
 
 #[async_trait]
 impl SnapshotRepository for OssSnapshotRepository {
+    fn template_build_files(
+        &self,
+    ) -> Option<Arc<dyn crate::snapshot::repository::TemplateBuildFileStore>> {
+        Some(Arc::clone(&self.build_files)
+            as Arc<
+                dyn crate::snapshot::repository::TemplateBuildFileStore,
+            >)
+    }
+
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         if !matches!(record.source, SnapshotSource::Template { .. }) {
             return Err(RepositoryError::InvalidRequest {
@@ -164,25 +176,28 @@ impl SnapshotRepository for OssSnapshotRepository {
                 reason: format!("snapshot '{}' already exists", record.id),
             });
         }
+        // When the alias already points at a live snapshot, leave the binding
+        // untouched so the existing template keeps resolving while the new
+        // build runs; a successful publish moves the alias to the new snapshot
+        // (E2B rebuild semantics).
+        let mut bind_on_create = true;
         if let Some(alias) = record.alias.as_ref() {
             if let Some(existing) = self.load_alias_target(alias.as_ref()).await? {
                 if existing != record.id && self.snapshot_exists(&existing).await? {
-                    return Err(RepositoryError::AliasConflict {
-                        alias: alias.to_string(),
-                        existing,
-                        new_id: record.id.clone(),
-                    });
+                    bind_on_create = false;
                 }
             }
         }
         self.write_record(&record).await?;
-        if let Some(alias) = record.alias.as_ref() {
-            if let Err(error) = self.bind_alias(alias.as_ref(), &record.id).await {
-                let _ = self
-                    .client
-                    .delete(&OssSnapshotArtifactLayout::record_key(&record.id))
-                    .await;
-                return Err(error);
+        if bind_on_create {
+            if let Some(alias) = record.alias.as_ref() {
+                if let Err(error) = self.bind_alias(alias.as_ref(), &record.id, false).await {
+                    let _ = self
+                        .client
+                        .delete(&OssSnapshotArtifactLayout::record_key(&record.id))
+                        .await;
+                    return Err(error);
+                }
             }
         }
         Ok(record)
@@ -287,26 +302,58 @@ impl SnapshotRepository for OssSnapshotRepository {
                 disk_publications: disk_publications.clone(),
             };
 
-            // 5. Bind alias (if present) with conflict detection.
+            // 5. Commit the record before moving the alias. This prevents an
+            //    alias from ever resolving to a snapshot whose catalog record
+            //    has not been published yet.
+            let previous_record = self.read_record(id).await?;
+            let previous_alias_target = if let Some(alias) = metadata.alias.as_ref() {
+                match self.load_alias_target(alias.as_ref()).await? {
+                    Some(existing) if self.snapshot_exists(&existing).await? => Some(existing),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let record = self
+                .write_committed_record(
+                    metadata.id.clone(),
+                    metadata.alias.clone(),
+                    metadata.resources,
+                    committed,
+                    metadata.source.clone(),
+                )
+                .await?;
+
+            // 6. Move the alias only after the new record is readable. If the
+            //    bind fails, restore the pending record and old alias.
             if let Some(ref alias) = metadata.alias {
-                if let Err(e) = self.bind_alias(alias.as_ref(), id).await {
-                    // Best-effort rollback. Content-addressed managed layers are intentionally left
-                    // in place; they are shared across snapshots and require separate GC.
-                    if let Err(error) = self.client.delete_prefix(&layout.artifact_prefix()).await {
-                        warn!(snapshot_id = %id, error = %error, "failed to roll back snapshot artifacts after alias bind failure");
+                if let Err(error) = self.bind_alias(alias.as_ref(), id, true).await {
+                    self.restore_alias_after_failed_bind(
+                        alias.as_ref(),
+                        id,
+                        previous_alias_target.as_ref(),
+                    )
+                    .await;
+                    self.restore_record_after_failed_publish(id, previous_record.as_ref())
+                        .await;
+                    return Err(error);
+                }
+                if let Some(previous_id) = previous_alias_target
+                    .as_ref()
+                    .filter(|previous_id| *previous_id != id)
+                {
+                    if let Err(error) = self.clear_record_alias(previous_id).await {
+                        warn!(
+                            alias = %alias,
+                            previous_snapshot_id = %previous_id,
+                            error = %error,
+                            "failed to clear previous snapshot alias metadata"
+                        );
                     }
-                    return Err(e);
                 }
             }
 
-            self.write_committed_record(
-                metadata.id.clone(),
-                metadata.alias.clone(),
-                metadata.resources,
-                committed,
-                metadata.source.clone(),
-            )
-            .await
+            Ok(record)
         }
         .await;
 
@@ -584,7 +631,8 @@ impl OssSnapshotRepository {
     /// Instead the algorithm is:
     ///   1. Read the current alias target.
     ///   2. If it already points to `id`, return success (idempotent).
-    ///   3. If it points to a live snapshot, return `AliasConflict`.
+    ///   3. If it points to a live snapshot: with `rebind` move the alias to
+    ///      `id` (E2B rebuild semantics), otherwise return `AliasConflict`.
     ///   4. If it points to a deleted snapshot, remove the stale alias.
     ///   5. Write our binding unconditionally.
     ///   6. Read back and verify we won the race.  If someone else wrote a
@@ -595,7 +643,7 @@ impl OssSnapshotRepository {
     /// interval between our write and the subsequent read.  This is weaker
     /// than a true CAS but sufficient for the current deployment model
     /// where concurrent publishes for the *same alias* are rare.
-    async fn bind_alias(&self, alias: &str, id: &SnapshotId) -> RepositoryResult<()> {
+    async fn bind_alias(&self, alias: &str, id: &SnapshotId, rebind: bool) -> RepositoryResult<()> {
         let key = validated_alias_key(alias)?;
         let payload = serde_json::to_vec(id)
             .map_err(|e| RepositoryError::backend("serialize alias binding", e))?;
@@ -608,18 +656,19 @@ impl OssSnapshotRepository {
                 }
 
                 let still_exists = self.snapshot_exists(&existing_id).await?;
-                if still_exists {
+                if still_exists && !rebind {
                     return Err(RepositoryError::AliasConflict {
                         alias: alias.to_string(),
                         existing: existing_id,
                         new_id: id.clone(),
                     });
                 }
-
-                self.client
-                    .delete(&key)
-                    .await
-                    .map_err(|e| RepositoryError::backend("delete stale alias", e))?;
+                if !still_exists {
+                    self.client
+                        .delete(&key)
+                        .await
+                        .map_err(|e| RepositoryError::backend("delete stale alias", e))?;
+                }
             }
 
             // Step 5: write our binding (unconditional — OSS does not
@@ -667,6 +716,85 @@ impl OssSnapshotRepository {
             ),
             source: None,
         })
+    }
+
+    async fn restore_record_after_failed_publish(
+        &self,
+        id: &SnapshotId,
+        previous_record: Option<&SnapshotRecord>,
+    ) {
+        let result = match previous_record {
+            Some(record) => self.write_record(record).await,
+            None => self
+                .client
+                .delete(&OssSnapshotArtifactLayout::record_key(id))
+                .await
+                .map_err(|error| RepositoryError::backend("remove failed snapshot record", error)),
+        };
+        if let Err(error) = result {
+            warn!(snapshot_id = %id, error = %error, "failed to restore snapshot record after publish failure");
+        }
+    }
+
+    async fn restore_alias_after_failed_bind(
+        &self,
+        alias: &str,
+        id: &SnapshotId,
+        previous_id: Option<&SnapshotId>,
+    ) {
+        let current = match self.load_alias_target(alias).await {
+            Ok(current) => current,
+            Err(error) => {
+                warn!(alias, snapshot_id = %id, error = %error, "failed to inspect alias during publish rollback");
+                return;
+            }
+        };
+        // Do not overwrite a concurrent publisher that already moved the
+        // alias elsewhere.
+        if current.as_ref() != Some(id) {
+            return;
+        }
+
+        let key = match validated_alias_key(alias) {
+            Ok(key) => key,
+            Err(error) => {
+                warn!(alias, snapshot_id = %id, error = %error, "failed to validate alias during publish rollback");
+                return;
+            }
+        };
+        let result =
+            match previous_id {
+                Some(previous_id) => match serde_json::to_vec(previous_id) {
+                    Ok(payload) => {
+                        self.client.put_bytes(&key, payload).await.map_err(|error| {
+                            RepositoryError::backend("restore alias binding", error)
+                        })
+                    }
+                    Err(error) => Err(RepositoryError::backend(
+                        "serialize restored alias binding",
+                        error,
+                    )),
+                },
+                None => self.client.delete(&key).await.map_err(|error| {
+                    RepositoryError::backend("remove failed alias binding", error)
+                }),
+            };
+        if let Err(error) = result {
+            warn!(alias, snapshot_id = %id, error = %error, "failed to restore alias after publish failure");
+        }
+    }
+
+    /// Clears the alias field on the record that previously owned a rebound
+    /// alias so template listings do not report the moved name twice.
+    async fn clear_record_alias(&self, id: &SnapshotId) -> RepositoryResult<()> {
+        if let Some(mut previous) = self.read_record(id).await? {
+            if previous.alias.is_some() {
+                previous.alias = None;
+                previous.updated_at_unix_ms = now_unix_ms();
+                self.write_record(&previous).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn export_managed_disk_image(

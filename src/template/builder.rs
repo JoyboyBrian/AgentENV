@@ -100,9 +100,12 @@ impl TemplateBuilder {
     async fn execute_and_publish(
         &self,
         snapshot_manager: &SnapshotManager,
-        context: TemplateBuildContext,
+        mut context: TemplateBuildContext,
         operation: &'static str,
     ) -> TemplatePipelineResult<SnapshotRecord> {
+        context.build_archives =
+            Self::materialize_build_archives(snapshot_manager, &context).await?;
+
         info!("executing template build");
         let build_execution = match TemplateBuildRunner::new().execute(&context) {
             Ok(execution) => execution,
@@ -151,6 +154,55 @@ impl TemplateBuilder {
 }
 
 impl TemplateBuilder {
+    /// Fetches every build-context archive referenced by COPY steps into
+    /// node-local files before the build sandbox starts.
+    async fn materialize_build_archives(
+        snapshot_manager: &SnapshotManager,
+        context: &TemplateBuildContext,
+    ) -> TemplatePipelineResult<std::collections::HashMap<String, std::path::PathBuf>> {
+        let hashes = TemplateBuildSpec::referenced_build_file_hashes(&context.steps);
+        if hashes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let Some(store) = snapshot_manager.template_build_files() else {
+            return Err(TemplateBuildError::invalid_input(
+                "the configured snapshot backend does not support the build-context uploads required by COPY steps",
+            )
+            .into());
+        };
+
+        let scratch = context.local_dir().join("build-archives");
+        tokio::fs::create_dir_all(&scratch).await.map_err(|error| {
+            TemplateBuildError::with_source("create build archive scratch dir", error)
+        })?;
+
+        let mut archives = std::collections::HashMap::new();
+        for hash in hashes {
+            match store.materialize(&hash, &scratch).await {
+                Ok(Some(path)) => {
+                    archives.insert(hash, path);
+                }
+                Ok(None) => {
+                    return Err(TemplateBuildError::invalid_input(format!(
+                        "build context archive '{hash}' has not been uploaded; request an upload \
+                         link via GET /templates/{{templateID}}/files/{hash} and upload the \
+                         archive before starting the build"
+                    ))
+                    .into());
+                }
+                Err(error) => {
+                    return Err(TemplateBuildError::with_source(
+                        format!("fetch build context archive '{hash}'"),
+                        error,
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(archives)
+    }
+
     fn build_failure_reason(error: &AnyhowError) -> TemplateBuildErrorReason {
         error
             .chain()
@@ -209,6 +261,7 @@ impl TemplateBuilder {
             resources,
             workspace,
             steps: spec.steps().to_vec(),
+            build_archives: std::collections::HashMap::new(),
             base,
             cpu_config_json: self.current_cpu_config(),
         })
@@ -261,6 +314,7 @@ impl TemplateBuilder {
             resources,
             workspace,
             steps: spec.steps().to_vec(),
+            build_archives: std::collections::HashMap::new(),
             base: TemplateBuildBase::Snapshot {
                 base_snapshot: Box::new(base_snapshot.clone()),
             },
