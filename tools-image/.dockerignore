@@ -2,4 +2,6 @@
 !Dockerfile
 !init
 !pivot-init
+!ensure-localhost-hosts
+!tests
 !Makefile

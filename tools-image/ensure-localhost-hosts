@@ -1,0 +1,67 @@
+#!/agentenv/bin/busybox sh
+# Guarantee that `localhost` resolves through the guest hosts file.
+#
+# Docker and Kubernetes treat /etc/hosts as a runtime-managed file, so OCI
+# images routinely ship it absent, empty, or without loopback entries while
+# still assuming `localhost` works. AgentENV boots those images directly as
+# Firecracker guests, so this script supplies the equivalent runtime
+# behavior: keep every image-provided entry and append only the missing
+# IPv4/IPv6 localhost mappings. Re-running it is a no-op, so repeated boots,
+# pause/resume cycles, and snapshot restores never duplicate entries.
+#
+# Path policy:
+#   - A symlink to an existing target is preserved; appends follow the link.
+#   - A dangling symlink is replaced by a regular file.
+#   - An unwritable path warns and exits 1; callers treat that as fail-open.
+#
+# Usage: ensure-localhost-hosts [hosts-file]    (defaults to /etc/hosts)
+
+BB="${BB:-/agentenv/bin/busybox}"
+HOSTS_FILE="${1:-/etc/hosts}"
+
+# A mapping only counts when `localhost` is a standalone hostname token:
+# bounded by whitespace, not a prefix of a longer name such as
+# localhost.localdomain, and not part of a `#` comment.
+LOCALHOST_TOKEN='([^#[:space:]]+[[:space:]]+)*localhost([[:space:]]|$)'
+
+NEED_V4=1
+NEED_V6=1
+if $BB grep -qE "^[[:space:]]*127\.[0-9]+\.[0-9]+\.[0-9]+[[:space:]]+$LOCALHOST_TOKEN" "$HOSTS_FILE" 2>/dev/null; then
+    NEED_V4=0
+fi
+if $BB grep -qE "^[[:space:]]*::1[[:space:]]+$LOCALHOST_TOKEN" "$HOSTS_FILE" 2>/dev/null; then
+    NEED_V6=0
+fi
+
+# Leave a satisfied file byte-for-byte untouched.
+if [ "$NEED_V4" = 0 ] && [ "$NEED_V6" = 0 ]; then
+    exit 0
+fi
+
+if [ ! -e "$HOSTS_FILE" ]; then
+    # Missing file or dangling symlink; recreate as a regular file. The
+    # parent directory may not exist in FROM scratch images.
+    $BB rm -f "$HOSTS_FILE" 2>/dev/null
+    case "$HOSTS_FILE" in
+        */*) $BB mkdir -p "${HOSTS_FILE%/*}" 2>/dev/null ;;
+    esac
+fi
+
+{
+    # Keep appended entries on their own lines even when the existing
+    # content lacks a trailing newline.
+    if [ -s "$HOSTS_FILE" ] && [ -n "$($BB tail -c 1 "$HOSTS_FILE" 2>/dev/null)" ]; then
+        echo
+    fi
+    if [ "$NEED_V4" = 1 ]; then
+        echo "127.0.0.1 localhost"
+    fi
+    if [ "$NEED_V6" = 1 ]; then
+        echo "::1 localhost"
+    fi
+} 2>/dev/null >> "$HOSTS_FILE" || {
+    echo "AGENTENV PIVOT INIT WARN: failed to write localhost entries to $HOSTS_FILE" >&2
+    exit 1
+}
+
+exit 0

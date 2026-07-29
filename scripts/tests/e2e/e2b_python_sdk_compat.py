@@ -151,6 +151,39 @@ def main() -> int:
         )
         log("command execution returned expected build artifacts and startup state")
 
+        # OCI images routinely ship /etc/hosts absent or empty and rely on the
+        # container runtime for localhost resolution; the guest bootstrap must
+        # provide the same guarantee (tools-image/ensure-localhost-hosts).
+        # Probe the files NSS source explicitly: a plain `getent hosts
+        # localhost` can be masked by an upstream resolver that answers
+        # `localhost` itself, hiding a broken hosts file. When getent is
+        # missing or does not support -s, fall back to an unmaskable
+        # hosts-file token check, printing a loopback line so both branches
+        # share assertions.
+        localhost_probe = (
+            "if getent -s files hosts localhost 2>/dev/null; then "
+            ": ; "
+            "else "
+            r"grep -qE '^[[:space:]]*(127\.[0-9]+\.[0-9]+\.[0-9]+|::1)"
+            r"[[:space:]]+([^#[:space:]]+[[:space:]]+)*localhost([[:space:]]|$)' /etc/hosts "
+            "&& echo 127.0.0.1 localhost; "
+            "fi"
+        )
+        resolution = retry(
+            lambda: sandbox.commands.run(localhost_probe, timeout=30, request_timeout=60),
+            "localhost resolution check",
+        )
+        require(
+            resolution.exit_code == 0,
+            f"localhost resolution probe exited with {resolution.exit_code}",
+        )
+        require(
+            "localhost" in resolution.stdout
+            and ("127.0.0.1" in resolution.stdout or "::1" in resolution.stdout),
+            f"localhost did not resolve to loopback: {resolution.stdout!r}",
+        )
+        log("guest localhost resolution verified")
+
         if os.environ.get("E2B_COMPAT_TEST_PAUSE", "1") != "0":
             log("pausing and reconnecting sandbox through SDK lifecycle APIs")
             sandbox.beta_pause(api_url=api_url, api_key=api_key, request_timeout=60)

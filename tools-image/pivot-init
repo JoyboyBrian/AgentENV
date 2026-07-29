@@ -81,14 +81,13 @@ $BB ip link set lo up 2>/dev/null \
     || $BB ifconfig lo up 2>/dev/null \
     || echo "AGENTENV PIVOT INIT WARN: failed to bring up loopback interface" >&2
 
-# /etc/hosts fallback for images that don't ship one. Most base images do,
-# but FROM scratch / distroless-style images may not.
-if [ ! -e /etc/hosts ]; then
-    {
-        echo "127.0.0.1 localhost"
-        echo "::1 localhost"
-    } > /etc/hosts
-fi
+# Guarantee `localhost` resolution. Docker and Kubernetes manage /etc/hosts
+# at container start, so OCI images routinely ship it absent, empty, or
+# without loopback entries and still assume localhost resolves. The helper
+# preserves image-provided entries, appends only the missing loopback
+# mappings, and is idempotent across resumes and reboots; failures degrade
+# to a WARN inside the helper.
+$BB sh /agentenv/ensure-localhost-hosts
 
 # ---- Guest-visible integration points ----
 
