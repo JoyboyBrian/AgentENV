@@ -20,8 +20,7 @@ if [ ! -f "$ENSURE_SCRIPT" ]; then
     exit 2
 fi
 
-WORK="${TMPDIR:-/tmp}/ensure-hosts-test.$$"
-mkdir -p "$WORK" || exit 2
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/ensure-hosts-test.XXXXXX")" || exit 2
 trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 if [ -z "${BB:-}" ]; then
@@ -117,6 +116,20 @@ before="$(file_content "$d/hosts")"
 run_ensure "$d/hosts"; assert_eq "satisfied file: exit 0" 0 $?
 assert_eq "satisfied file: byte-identical" "$before" "$(file_content "$d/hosts")"
 
+# --- malformed IPv4 loopback does not suppress the canonical mapping -----
+d="$WORK/malformed-v4"; mkdir -p "$d"
+printf '127.999.999.999 localhost\n::1 localhost\n' > "$d/hosts"
+run_ensure "$d/hosts"
+assert_file "malformed IPv4: canonical mapping appended" "$d/hosts" \
+"127.999.999.999 localhost${NL}::1 localhost${NL}127.0.0.1 localhost${NL}"
+
+# --- a valid non-canonical 127/8 mapping still satisfies IPv4 -------------
+d="$WORK/valid-v4"; mkdir -p "$d"
+printf '127.12.34.56 localhost\n::1 localhost\n' > "$d/hosts"
+before="$(file_content "$d/hosts")"
+run_ensure "$d/hosts"
+assert_eq "valid IPv4 loopback: byte-identical" "$before" "$(file_content "$d/hosts")"
+
 # --- re-running never duplicates entries ----------------------------------
 d="$WORK/rerun"; mkdir -p "$d"
 : > "$d/hosts"
@@ -187,18 +200,17 @@ run_ensure "$d/hosts"
 check "valid symlink: link preserved" test -L "$d/hosts"
 assert_file "valid symlink: target received mappings" "$d/real/hosts" "$BOTH"
 
-# --- unwritable directory fails open with a warning -----------------------
-if [ "$(id -u)" = "0" ]; then
-    echo "skip: unwritable directory (running as root)"
-else
-    d="$WORK/readonly"; mkdir -p "$d"
-    chmod 0555 "$d"
-    run_ensure "$d/hosts"
-    status=$?
-    chmod 0755 "$d"
-    assert_eq "unwritable dir: exit 1" 1 "$status"
-    check "unwritable dir: no file created" test ! -e "$d/hosts"
-fi
+# --- unusable path fails open with a warning, even when run as root -------
+d="$WORK/unusable"; mkdir -p "$d"
+: > "$d/not-a-directory"
+stderr="$d/stderr"
+run_ensure "$d/not-a-directory/hosts" 2> "$stderr"
+status=$?
+assert_eq "unusable path: exit 1" 1 "$status"
+check "unusable path: no file created" test ! -e "$d/not-a-directory/hosts"
+check "unusable path: warning emitted" grep -qF \
+    "AGENTENV PIVOT INIT WARN: failed to write localhost entries to $d/not-a-directory/hosts" \
+    "$stderr"
 
 echo
 echo "ensure-localhost-hosts tests: $PASS passed, $FAIL failed"

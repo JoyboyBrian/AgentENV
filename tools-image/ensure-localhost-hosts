@@ -24,9 +24,14 @@ HOSTS_FILE="${1:-/etc/hosts}"
 # localhost.localdomain, and not part of a `#` comment.
 LOCALHOST_TOKEN='([^#[:space:]]+[[:space:]]+)*localhost([[:space:]]|$)'
 
+# Accept any dotted-decimal address in the IPv4 loopback block, but reject
+# malformed octets that libc will not resolve (for example 127.999.999.999).
+IPV4_OCTET='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+IPV4_LOOPBACK="127\\.$IPV4_OCTET\\.$IPV4_OCTET\\.$IPV4_OCTET"
+
 NEED_V4=1
 NEED_V6=1
-if $BB grep -qE "^[[:space:]]*127\.[0-9]+\.[0-9]+\.[0-9]+[[:space:]]+$LOCALHOST_TOKEN" "$HOSTS_FILE" 2>/dev/null; then
+if $BB grep -qE "^[[:space:]]*$IPV4_LOOPBACK[[:space:]]+$LOCALHOST_TOKEN" "$HOSTS_FILE" 2>/dev/null; then
     NEED_V4=0
 fi
 if $BB grep -qE "^[[:space:]]*::1[[:space:]]+$LOCALHOST_TOKEN" "$HOSTS_FILE" 2>/dev/null; then
