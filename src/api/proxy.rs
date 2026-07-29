@@ -224,7 +224,18 @@ where
     I: AsRef<ApiImpl> + Send + Sync,
 {
     if !has_routing_header(request.headers()) {
-        return StatusCode::NOT_FOUND.into_response();
+        // Unmatched control-plane route: return the API error envelope so
+        // JSON clients surface "route not found" instead of failing to parse
+        // an empty 404 body.
+        let error = agentenv_http_server::models::Error::new(
+            404,
+            format!(
+                "route not found: {} {}",
+                request.method(),
+                request.uri().path()
+            ),
+        );
+        return (StatusCode::NOT_FOUND, axum::Json(error)).into_response();
     }
     let forward_path = request.uri().path().to_owned();
     with_route_source(
@@ -2120,6 +2131,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            content_type.starts_with("application/json"),
+            "unexpected content-type: {content_type}"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["code"], 404);
+        let message = payload["message"].as_str().unwrap();
+        assert!(
+            message.contains("route not found: GET /nonexistent/path"),
+            "unexpected message: {message}"
+        );
     }
 
     #[tokio::test]
