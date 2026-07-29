@@ -13,7 +13,7 @@ The build is intentionally self-contained:
 
 1. Clone and compile `envd` from `e2b-dev/infra` at `ENVD_REF`.
 2. Assemble the guest tools rootfs with BusyBox, `/init`, `/agentenv/pivot-init`,
-   `/agentenv/ensure-localhost-hosts`, and `/agentenv/envd`.
+   and `/agentenv/envd`.
 3. Create `/tools.ext4`.
 
 Requirements:

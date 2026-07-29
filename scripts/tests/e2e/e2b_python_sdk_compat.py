@@ -152,36 +152,21 @@ def main() -> int:
         log("command execution returned expected build artifacts and startup state")
 
         # OCI images routinely ship /etc/hosts absent or empty and rely on the
-        # container runtime for localhost resolution; the guest bootstrap must
-        # provide the same guarantee (tools-image/ensure-localhost-hosts).
-        # Probe the files NSS source explicitly: a plain `getent hosts
-        # localhost` can be masked by an upstream resolver that answers
-        # `localhost` itself, hiding a broken hosts file. When getent is
-        # missing or does not support -s, fall back to the bundled BusyBox for
-        # an unmaskable hosts-file token check, printing a loopback line so
-        # both branches share assertions even in distroless images.
-        localhost_probe = (
-            "if getent -s files hosts localhost 2>/dev/null; then "
-            ": ; "
-            "else "
-            r"/agentenv/bin/busybox grep -qiE '^[[:space:]]*(127\.0\.0\.1|::1)"
-            r"[[:space:]]+([^#[:space:]]+[[:space:]]+)*localhost([[:space:]]|$)' /etc/hosts "
-            "&& echo 127.0.0.1 localhost; "
-            "fi"
-        )
+        # container runtime for localhost resolution; the guest bootstrap
+        # (pivot-init) must provide the same guarantee. Assert the hosts file
+        # carries a loopback -> localhost mapping.
         resolution = retry(
-            lambda: sandbox.commands.run(localhost_probe, timeout=30, request_timeout=60),
+            lambda: sandbox.commands.run(
+                r"/agentenv/bin/busybox grep -E "
+                r"'^(127\.0\.0\.1|::1)[[:space:]]+localhost([[:space:]]|$)' /etc/hosts",
+                timeout=30,
+                request_timeout=60,
+            ),
             "localhost resolution check",
         )
         require(
             resolution.exit_code == 0,
-            f"localhost resolution probe exited with {resolution.exit_code}",
-        )
-        resolution_stdout = resolution.stdout.lower()
-        require(
-            "localhost" in resolution_stdout
-            and ("127.0.0.1" in resolution_stdout or "::1" in resolution_stdout),
-            f"localhost did not resolve to loopback: {resolution.stdout!r}",
+            f"/etc/hosts lacks a loopback localhost entry: {resolution.stdout!r}",
         )
         log("guest localhost resolution verified")
 

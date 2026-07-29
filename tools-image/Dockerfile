@@ -87,11 +87,10 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 #
 # This is not a normal Linux distribution rootfs. It only contains the minimal
 # bootstrap files needed before and after pivot_root:
-#   /init                            PID 1 before pivoting into the user rootfs
-#   /agentenv/pivot-init             post-pivot bootstrap
-#   /agentenv/ensure-localhost-hosts guest /etc/hosts localhost bootstrap
-#   /agentenv/envd                   compiled control-plane daemon
-#   /agentenv/bin/busybox            stable helper binary for init scripts
+#   /init                         PID 1 before pivoting into the user rootfs
+#   /agentenv/pivot-init          post-pivot bootstrap
+#   /agentenv/envd                compiled control-plane daemon
+#   /agentenv/bin/busybox         stable helper binary for init scripts
 # ---------------------------------------------------------------------------
 FROM --platform=${TARGETPLATFORM} ${BUSYBOX_IMAGE} AS rootfs
 
@@ -99,7 +98,6 @@ ARG TOOLS_VERSION
 
 COPY --chmod=0755 init /tools-rootfs/init
 COPY --chmod=0755 pivot-init /tools-rootfs/agentenv/pivot-init
-COPY --chmod=0755 ensure-localhost-hosts /tools-rootfs/agentenv/ensure-localhost-hosts
 COPY --chmod=0755 --from=envd-builder /out/envd /tools-rootfs/agentenv/envd
 
 RUN set -eux; \
@@ -118,15 +116,6 @@ RUN set -eux; \
       { echo "BusyBox runsv applet missing; rebuild with CONFIG_RUNSV=y" >&2; exit 1; }; \
     /tools-rootfs/agentenv/bin/busybox --list | grep -qx 'svlogd' || \
       { echo "BusyBox svlogd applet missing; rebuild with CONFIG_SVLOGD=y" >&2; exit 1; }
-
-# Regression-test the hosts bootstrap with the exact BusyBox binary that
-# ships in the drive. The test tree lives outside /tools-rootfs, so it never
-# reaches the exported ext4.
-COPY tests/test-ensure-localhost-hosts.sh /tools-tests/test-ensure-localhost-hosts.sh
-RUN BB=/tools-rootfs/agentenv/bin/busybox \
-    /tools-rootfs/agentenv/bin/busybox sh \
-      /tools-tests/test-ensure-localhost-hosts.sh \
-      /tools-rootfs/agentenv/ensure-localhost-hosts
 
 # ---------------------------------------------------------------------------
 # Stage 3: materialize the rootfs as an ext4 disk image.
