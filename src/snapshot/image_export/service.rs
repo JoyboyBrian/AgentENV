@@ -67,6 +67,7 @@ impl SnapshotImageService {
                     let repository = Arc::new(posixfs::PosixFsSnapshotRepository::new(
                         Arc::new(posixfs::PosixFsCatalogStore::new(root.clone())),
                         Arc::new(posixfs::PosixFsArtifactStore::new(root.clone())),
+                        posixfs::PosixFsTemplateBuildFileStore::new(&root),
                     ));
                     (repository, ManagedLayerLocator::PosixFs { root })
                 }
@@ -431,6 +432,7 @@ mod tests {
         let repository = posixfs::PosixFsSnapshotRepository::new(
             Arc::new(posixfs::PosixFsCatalogStore::new(root.clone())),
             Arc::new(posixfs::PosixFsArtifactStore::new(root.clone())),
+            posixfs::PosixFsTemplateBuildFileStore::new(&root),
         );
         let uncommitted =
             SnapshotRecord::template_waiting(SnapshotId::generate(), None, Default::default());
