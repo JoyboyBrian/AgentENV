@@ -1,5 +1,3 @@
-#![allow(dead_code)] // TODO(e2b-stack): removed when the COPY executor lands
-
 //! Host-side planning for template `COPY` steps.
 //!
 //! The E2B SDK uploads one tar archive per `COPY` instruction whose entry
