@@ -8,13 +8,16 @@
 #
 # It also runs under any POSIX shell on a dev host: it prefers a `busybox`
 # from PATH and otherwise falls back to a shim that forwards `$BB <applet>`
-# invocations to the system utilities. Paths must not contain whitespace
-# because `$BB` is expanded unquoted, mirroring how pivot-init uses it.
+# invocations to the system utilities.
 
 set -u
 
 TEST_DIR="$(dirname "$0")"
 ENSURE_SCRIPT="${1:-$TEST_DIR/../ensure-localhost-hosts}"
+case "$ENSURE_SCRIPT" in
+    /*) ;;
+    *) ENSURE_SCRIPT="$(pwd)/$ENSURE_SCRIPT" ;;
+esac
 if [ ! -f "$ENSURE_SCRIPT" ]; then
     echo "ensure-localhost-hosts not found at $ENSURE_SCRIPT" >&2
     exit 2
@@ -42,7 +45,7 @@ PASS=0
 FAIL=0
 
 run_ensure() {
-    $BB sh "$ENSURE_SCRIPT" "$1"
+    "$BB" sh "$ENSURE_SCRIPT" "$1"
 }
 
 # Compare full file content including trailing newlines: command
@@ -50,6 +53,15 @@ run_ensure() {
 file_content() {
     cat "$1" 2>/dev/null
     printf x
+}
+
+# GNU/BusyBox stat uses -c while BSD stat uses -f. The fallback shim exposes
+# the host implementation, so support both forms.
+file_mode() {
+    if "$BB" stat -c '%a' -- "$1" 2>/dev/null; then
+        return 0
+    fi
+    stat -f '%Lp' "$1" 2>/dev/null
 }
 
 assert_file() { # $1 case name, $2 path, $3 expected content
@@ -93,14 +105,17 @@ check() { # $1 case name, then a command to run
 
 # --- absent file is created with both mappings ----------------------------
 d="$WORK/absent"; mkdir -p "$d"
-run_ensure "$d/hosts"; assert_eq "absent file: exit 0" 0 $?
+(umask 000 && run_ensure "$d/hosts"); assert_eq "absent file: exit 0" 0 $?
 assert_file "absent file: created with localhost mappings" "$d/hosts" "$BOTH"
+assert_eq "absent file: mode normalized" 644 "$(file_mode "$d/hosts")"
 
-# --- empty file (Docker/Kubernetes placeholder) gets both mappings --------
+# --- existing empty file gets mappings without changing its mode ----------
 d="$WORK/empty"; mkdir -p "$d"
 : > "$d/hosts"
+chmod 0600 "$d/hosts"
 run_ensure "$d/hosts"; assert_eq "empty file: exit 0" 0 $?
 assert_file "empty file: localhost mappings appended" "$d/hosts" "$BOTH"
+assert_eq "empty file: existing mode preserved" 600 "$(file_mode "$d/hosts")"
 
 # --- unrelated entries are preserved, mappings appended -------------------
 d="$WORK/unrelated"; mkdir -p "$d"
@@ -112,9 +127,11 @@ assert_file "unrelated entries: preserved and localhost appended" "$d/hosts" \
 # --- satisfied file stays byte-identical ----------------------------------
 d="$WORK/satisfied"; mkdir -p "$d"
 printf '127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n' > "$d/hosts"
+chmod 0640 "$d/hosts"
 before="$(file_content "$d/hosts")"
 run_ensure "$d/hosts"; assert_eq "satisfied file: exit 0" 0 $?
 assert_eq "satisfied file: byte-identical" "$before" "$(file_content "$d/hosts")"
+assert_eq "satisfied file: mode preserved" 640 "$(file_mode "$d/hosts")"
 
 # --- malformed IPv4 loopback does not suppress the canonical mapping -----
 d="$WORK/malformed-v4"; mkdir -p "$d"
@@ -122,13 +139,23 @@ printf '127.999.999.999 localhost\n::1 localhost\n' > "$d/hosts"
 run_ensure "$d/hosts"
 assert_file "malformed IPv4: canonical mapping appended" "$d/hosts" \
 "127.999.999.999 localhost${NL}::1 localhost${NL}127.0.0.1 localhost${NL}"
-
-# --- a valid non-canonical 127/8 mapping still satisfies IPv4 -------------
-d="$WORK/valid-v4"; mkdir -p "$d"
-printf '127.12.34.56 localhost\n::1 localhost\n' > "$d/hosts"
 before="$(file_content "$d/hosts")"
 run_ensure "$d/hosts"
-assert_eq "valid IPv4 loopback: byte-identical" "$before" "$(file_content "$d/hosts")"
+assert_eq "malformed IPv4: re-run is byte-identical" "$before" "$(file_content "$d/hosts")"
+
+# --- a non-canonical 127/8 mapping does not replace the canonical entry ----
+d="$WORK/valid-v4"; mkdir -p "$d"
+printf '127.12.34.56 localhost\n::1 localhost\n' > "$d/hosts"
+run_ensure "$d/hosts"
+assert_file "non-canonical IPv4: canonical mapping appended" "$d/hosts" \
+"127.12.34.56 localhost${NL}::1 localhost${NL}127.0.0.1 localhost${NL}"
+
+# --- hostname matching is case-insensitive --------------------------------
+d="$WORK/case"; mkdir -p "$d"
+printf '127.0.0.1 LOCALHOST\n::1 LocalHost\n' > "$d/hosts"
+before="$(file_content "$d/hosts")"
+run_ensure "$d/hosts"
+assert_eq "hostname case: byte-identical" "$before" "$(file_content "$d/hosts")"
 
 # --- re-running never duplicates entries ----------------------------------
 d="$WORK/rerun"; mkdir -p "$d"
@@ -180,25 +207,69 @@ before="$(file_content "$d/hosts")"
 run_ensure "$d/hosts"
 assert_eq "whitespace variants: byte-identical" "$before" "$(file_content "$d/hosts")"
 
-# --- missing parent directory is created ----------------------------------
+# --- missing parents and file have deterministic modes under umask 077 ----
 d="$WORK/noetc"
-run_ensure "$d/etc/hosts"; assert_eq "missing parent dir: exit 0" 0 $?
+(umask 077 && run_ensure "$d/etc/hosts"); assert_eq "missing parent dir: exit 0" 0 $?
 assert_file "missing parent dir: file created" "$d/etc/hosts" "$BOTH"
+assert_eq "missing parent dir: mode normalized" 755 "$(file_mode "$d/etc")"
+assert_eq "missing parent dir: file mode normalized" 644 "$(file_mode "$d/etc/hosts")"
+
+# --- paths containing whitespace are supported ----------------------------
+d="$WORK/path with spaces"
+run_ensure "$d/etc/hosts"; assert_eq "space path: exit 0" 0 $?
+assert_file "space path: file created" "$d/etc/hosts" "$BOTH"
 
 # --- dangling symlink is replaced by a regular file -----------------------
 d="$WORK/dangling"; mkdir -p "$d"
 ln -s "$d/target-does-not-exist" "$d/hosts"
-run_ensure "$d/hosts"
+(umask 077 && run_ensure "$d/hosts")
 check "dangling symlink: replaced by regular file" test ! -L "$d/hosts"
 assert_file "dangling symlink: mappings written" "$d/hosts" "$BOTH"
+assert_eq "dangling symlink: mode normalized" 644 "$(file_mode "$d/hosts")"
 
 # --- valid symlink is preserved; appends follow it ------------------------
 d="$WORK/symlink"; mkdir -p "$d/real"
 : > "$d/real/hosts"
+chmod 0600 "$d/real/hosts"
 ln -s "$d/real/hosts" "$d/hosts"
 run_ensure "$d/hosts"
 check "valid symlink: link preserved" test -L "$d/hosts"
 assert_file "valid symlink: target received mappings" "$d/real/hosts" "$BOTH"
+assert_eq "valid symlink: target mode preserved" 600 "$(file_mode "$d/real/hosts")"
+
+# --- option-like existing path is detected and remains idempotent ---------
+d="$WORK/option-file"; mkdir -p "$d"
+printf '%s' "$BOTH" > "$d/-hosts"
+before="$(file_content "$d/-hosts")"
+(cd "$d" && run_ensure -hosts && run_ensure -hosts)
+assert_eq "option-like file: re-runs are byte-identical" "$before" "$(file_content "$d/-hosts")"
+
+# --- option-like dangling path is safely replaced -------------------------
+d="$WORK/option-dangling"; mkdir -p "$d"
+ln -s target-does-not-exist "$d/-hosts"
+(cd "$d" && umask 077 && run_ensure -hosts)
+check "option-like dangling path: link replaced" test ! -L "$d/-hosts"
+assert_file "option-like dangling path: mappings written" "$d/-hosts" "$BOTH"
+assert_eq "option-like dangling path: mode normalized" 644 "$(file_mode "$d/-hosts")"
+
+# --- option-like missing parent is safely created -------------------------
+d="$WORK/option-parent"; mkdir -p "$d"
+(cd "$d" && umask 077 && run_ensure -etc/hosts)
+assert_file "option-like parent: mappings written" "$d/-etc/hosts" "$BOTH"
+assert_eq "option-like parent: directory mode normalized" 755 "$(file_mode "$d/-etc")"
+assert_eq "option-like parent: file mode normalized" 644 "$(file_mode "$d/-etc/hosts")"
+
+# --- symlink to a non-regular target fails open without writing -----------
+d="$WORK/device-symlink"; mkdir -p "$d"
+ln -s /dev/null "$d/hosts"
+stderr="$d/stderr"
+run_ensure "$d/hosts" 2> "$stderr"
+status=$?
+assert_eq "device symlink: exit 1" 1 "$status"
+check "device symlink: link preserved" test -L "$d/hosts"
+check "device symlink: warning emitted" grep -qF \
+    "AGENTENV PIVOT INIT WARN: failed to write localhost entries to $d/hosts" \
+    "$stderr"
 
 # --- unusable path fails open with a warning, even when run as root -------
 d="$WORK/unusable"; mkdir -p "$d"

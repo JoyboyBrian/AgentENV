@@ -157,14 +157,14 @@ def main() -> int:
         # Probe the files NSS source explicitly: a plain `getent hosts
         # localhost` can be masked by an upstream resolver that answers
         # `localhost` itself, hiding a broken hosts file. When getent is
-        # missing or does not support -s, fall back to an unmaskable
-        # hosts-file token check, printing a loopback line so both branches
-        # share assertions.
+        # missing or does not support -s, fall back to the bundled BusyBox for
+        # an unmaskable hosts-file token check, printing a loopback line so
+        # both branches share assertions even in distroless images.
         localhost_probe = (
             "if getent -s files hosts localhost 2>/dev/null; then "
             ": ; "
             "else "
-            r"grep -qE '^[[:space:]]*(127\.[0-9]+\.[0-9]+\.[0-9]+|::1)"
+            r"/agentenv/bin/busybox grep -qiE '^[[:space:]]*(127\.0\.0\.1|::1)"
             r"[[:space:]]+([^#[:space:]]+[[:space:]]+)*localhost([[:space:]]|$)' /etc/hosts "
             "&& echo 127.0.0.1 localhost; "
             "fi"
@@ -177,9 +177,10 @@ def main() -> int:
             resolution.exit_code == 0,
             f"localhost resolution probe exited with {resolution.exit_code}",
         )
+        resolution_stdout = resolution.stdout.lower()
         require(
-            "localhost" in resolution.stdout
-            and ("127.0.0.1" in resolution.stdout or "::1" in resolution.stdout),
+            "localhost" in resolution_stdout
+            and ("127.0.0.1" in resolution_stdout or "::1" in resolution_stdout),
             f"localhost did not resolve to loopback: {resolution.stdout!r}",
         )
         log("guest localhost resolution verified")
