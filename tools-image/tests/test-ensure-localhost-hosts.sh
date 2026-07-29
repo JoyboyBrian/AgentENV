@@ -6,9 +6,9 @@
 #
 #   BB=<busybox> <busybox> sh test-ensure-localhost-hosts.sh <script>
 #
-# It also runs under any POSIX shell on a dev host: it prefers a `busybox`
-# from PATH and otherwise falls back to a shim that forwards `$BB <applet>`
-# invocations to the system utilities.
+# It also runs under `/bin/sh` on common macOS and Linux development hosts: it
+# prefers a `busybox` from PATH and otherwise forwards `$BB <applet>` calls to
+# the host utilities. It is not intended for a strictly POSIX-only userland.
 
 set -u
 
@@ -24,7 +24,7 @@ if [ ! -f "$ENSURE_SCRIPT" ]; then
 fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ensure-hosts-test.XXXXXX")" || exit 2
-trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
+trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' 0
 
 if [ -z "${BB:-}" ]; then
     if command -v busybox >/dev/null 2>&1; then
