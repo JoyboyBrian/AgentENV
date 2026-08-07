@@ -213,6 +213,18 @@ impl PosixFsTemplateBuildFileStore {
                             let _ = fs::remove_file(&path);
                             RepositoryError::backend("write upload grant", error)
                         })?;
+                    drop(file);
+                    // Make the new directory entry durable where supported.
+                    // Some shared filesystems reject directory fsync; losing a
+                    // grant after a host crash only requires requesting a fresh
+                    // upload URL, so keep that case best-effort.
+                    if let Err(error) = fs::File::open(&grants_dir).and_then(|dir| dir.sync_all()) {
+                        debug!(
+                            path = %grants_dir.display(),
+                            error = %error,
+                            "failed to sync upload grants directory"
+                        );
+                    }
                     return Ok(token);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,

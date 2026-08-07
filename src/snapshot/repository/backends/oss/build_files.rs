@@ -15,8 +15,11 @@ const BUILD_FILES_PREFIX: &str = "template-build-files";
 /// Build-context archive store backed by the OSS repository bucket.
 ///
 /// Layout: `template-build-files/{hash}.tar` plus durable bearer grants under
-/// `template-build-files/upload-grants/`. Retention is delegated to bucket
-/// lifecycle rules; archives are cache entries the SDK re-uploads when absent.
+/// `template-build-files/upload-grants/`. Operators must configure a bucket
+/// lifecycle expiration rule for this prefix; AgentENV does not provision or
+/// validate one. A seven-day expiration matches the POSIX cache retention and
+/// safely covers the maximum supported upload-link TTL. Archives are cache
+/// entries the SDK re-uploads when absent.
 pub(crate) struct OssTemplateBuildFileStore {
     client: Arc<OssClient>,
 }

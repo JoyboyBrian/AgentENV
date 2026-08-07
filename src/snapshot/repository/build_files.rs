@@ -113,16 +113,22 @@ pub trait TemplateBuildFileStore: Send + Sync {
     /// Claims a durable bearer grant, returning whether it authorized this
     /// upload.
     ///
-    /// Grants are single-use: a successful claim consumes the grant, so an
-    /// upload URL cannot be replayed within its TTL. Implementations must
-    /// make the claim itself the atomic step wherever the backend offers an
-    /// atomic primitive (a POSIX filesystem does, via rename/unlink), so
-    /// concurrent requests carrying the same token cannot both succeed.
+    /// A successful claim consumes the grant, so later requests cannot reuse
+    /// it. Implementations must make the claim itself atomic wherever the
+    /// backend offers an atomic primitive (a POSIX filesystem does, via
+    /// unlink), so concurrent requests carrying the same token cannot both
+    /// report a successful claim.
+    ///
+    /// Claiming is deliberately not a pre-publication reservation: callers
+    /// verify first so failed staging or publication remains retryable, then
+    /// claim after publication. Simultaneous holders of the same bearer token
+    /// can therefore race publication before one claim succeeds. Possession of
+    /// the token already authorizes publication for its bound
+    /// (template_id, hash); this protocol does not add content authenticity,
+    /// and repeated uploads for one hash must describe equivalent build input.
+    ///
     /// S3-compatible backends have no conditional delete and therefore
-    /// degrade to best-effort single-use within the grant TTL. Simultaneous
-    /// requests can both publish, but each grant is bound to the same
-    /// (template_id, hash), and the upload protocol requires repeated uploads
-    /// for one hash to describe equivalent build input.
+    /// degrade the claim itself to best-effort single-use within the grant TTL.
     async fn claim_upload_grant(
         &self,
         token: &str,
