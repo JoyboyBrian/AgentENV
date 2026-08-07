@@ -38,7 +38,7 @@ impl TemplateBuildUploadGrant {
         expires_unix: i64,
         now_unix: i64,
     ) -> bool {
-        now_unix <= expires_unix
+        now_unix < expires_unix
             && self.expires_unix == expires_unix
             && self.template_id == template_id
             && self.hash == hash
@@ -65,13 +65,12 @@ pub trait TemplateBuildFileStore: Send + Sync {
 
     /// Imports a fully written local file as the archive for `hash`.
     ///
-    /// Implementations must publish atomically: concurrent readers never
-    /// observe a partially imported archive. `hash` is the cache key supplied
-    /// by the authenticated caller, not a digest the store verifies, so
-    /// immutability here means first-write-wins stability rather than content
-    /// authenticity: importing a hash that is already stored keeps the stored
-    /// archive, so an in-flight build can never observe its build context
-    /// change underneath it.
+    /// Implementations must publish each upload atomically: concurrent readers
+    /// may observe either the previous complete archive or the newly imported
+    /// complete archive, but never a partially imported archive. `hash` is the
+    /// SDK-supplied cache key rather than a digest the store verifies, so the
+    /// protocol assumes repeated uploads for one hash describe equivalent
+    /// build input; the store does not provide content authenticity.
     async fn import(&self, hash: &str, staged: &Path) -> RepositoryResult<()>;
 
     /// Materializes the archive for `hash` as a node-local file.
@@ -120,11 +119,10 @@ pub trait TemplateBuildFileStore: Send + Sync {
     /// atomic primitive (a POSIX filesystem does, via rename/unlink), so
     /// concurrent requests carrying the same token cannot both succeed.
     /// S3-compatible backends have no conditional delete and therefore
-    /// degrade to best-effort single-use within the grant TTL; archive
-    /// immutability is what keeps a lost race from mattering: both uploads are
-    /// bound to the same (template_id, hash), and `import` is first-write-wins,
-    /// so neither can change an archive that is already stored — which upload
-    /// wins a first store is undefined.
+    /// degrade to best-effort single-use within the grant TTL. Simultaneous
+    /// requests can both publish, but each grant is bound to the same
+    /// (template_id, hash), and the upload protocol requires repeated uploads
+    /// for one hash to describe equivalent build input.
     async fn claim_upload_grant(
         &self,
         token: &str,
@@ -189,6 +187,7 @@ mod tests {
     fn upload_grant_is_bound_to_request_and_expiry() {
         let grant = TemplateBuildUploadGrant::new("tmpl", "aabbccddeeff0011", 1000);
         assert!(grant.authorizes("tmpl", "aabbccddeeff0011", 1000, 999));
+        assert!(!grant.authorizes("tmpl", "aabbccddeeff0011", 1000, 1000));
         assert!(!grant.authorizes("tmpl", "aabbccddeeff0011", 1000, 1001));
         assert!(!grant.authorizes("other", "aabbccddeeff0011", 1000, 999));
         assert!(!grant.authorizes("tmpl", "aabbccddeeff0012", 1000, 999));

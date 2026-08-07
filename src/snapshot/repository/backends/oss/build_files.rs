@@ -65,12 +65,10 @@ impl TemplateBuildFileStore for OssTemplateBuildFileStore {
 
     async fn import(&self, hash: &str, staged: &Path) -> RepositoryResult<()> {
         let key = Self::archive_key(hash)?;
-        // Archives are immutable so a repeat upload cannot change what an
-        // in-flight build reads. This fast path is not atomic against a
-        // concurrent import: the loser's bytes are dropped, and since the hash
-        // is a caller-supplied cache key rather than a verified digest, which
-        // racing upload wins is undefined — first-write-wins stability, not
-        // content authenticity.
+        // This is a bandwidth-saving fast path, not an atomic check-and-create:
+        // concurrent uploads may both complete. Each object publication is
+        // atomic, and the upload protocol treats repeated uploads for one hash
+        // as equivalent build input.
         if self
             .client
             .exists(&key)
@@ -156,10 +154,10 @@ impl TemplateBuildFileStore for OssTemplateBuildFileStore {
         if !grant.authorizes(template_id, hash, expires_unix, now_unix) {
             return Ok(false);
         }
-        // Consume the grant so the upload URL cannot be replayed. S3-compatible
-        // stores offer no conditional delete, so simultaneous replays of one
-        // token can both observe the grant; archives are immutable, which is
-        // what keeps that from mattering.
+        // Consume the grant so the upload URL cannot normally be replayed.
+        // S3-compatible stores offer no conditional delete, so simultaneous
+        // replays of one token can both observe the grant and publish the same
+        // logical build input.
         self.client
             .delete(&key)
             .await

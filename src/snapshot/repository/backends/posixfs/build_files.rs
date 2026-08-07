@@ -14,7 +14,8 @@ use crate::snapshot::repository::build_files::{
 };
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 
-/// How long imported build-context archives and upload grants are retained.
+/// Target retention window for build-context archives and upload grants.
+/// Cleanup is opportunistic and does not provide a strict storage bound.
 /// Archives are cache entries keyed by content hash; the SDK re-uploads any
 /// archive that has been pruned, so expiry only costs one extra upload.
 /// Grants expire after `template_build.files_url_ttl_secs` anyway, so this
@@ -67,9 +68,9 @@ impl PosixFsTemplateBuildFileStore {
 
     /// Removes upload grants that have passed their own `expires_unix`. Runs
     /// opportunistically whenever a new grant is written, so the grants
-    /// directory stays bounded by upload-link traffic; the scan is bounded per
-    /// call and drains the backlog over successive requests, and failures only
-    /// log.
+    /// directory receives regular best-effort cleanup. The scan is bounded per
+    /// call, does not guarantee that every entry is eventually visited, and
+    /// failures only log.
     ///
     /// Pruning by the record rather than by mtime keeps grants alive for
     /// exactly their TTL even when `template_build.files_url_ttl_secs` is
@@ -97,8 +98,9 @@ impl PosixFsTemplateBuildFileStore {
 
     /// Pruning is opportunistic and bounded: at most `MAX_PRUNE_SCAN` matching
     /// entries are inspected per call, so the cost a request pays stays
-    /// constant no matter how many records the directory holds. Anything left
-    /// over is reclaimed by later calls.
+    /// constant no matter how many records the directory holds. Later calls
+    /// may reclaim additional entries, but this is not a strict retention or
+    /// fairness guarantee.
     fn prune_dir(
         dir: &Path,
         extension: &str,
@@ -157,10 +159,10 @@ impl PosixFsTemplateBuildFileStore {
             .map_err(|error| RepositoryError::backend("parse upload grant", error))
     }
 
-    /// Best-effort mtime refresh, so retention means "unused for the window"
-    /// and an archive a build is still reading stays outside the prune
-    /// horizon. Read-only repository mounts must keep working, so failures
-    /// only log.
+    /// Best-effort mtime refresh, so recently materialized archives normally
+    /// stay outside the prune horizon. This is not a lease against a concurrent
+    /// prune. Read-only repository mounts must keep working, so failures only
+    /// log.
     fn touch(path: &Path) {
         let refreshed = fs::File::options()
             .write(true)
