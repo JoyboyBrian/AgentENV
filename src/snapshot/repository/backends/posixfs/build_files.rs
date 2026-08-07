@@ -76,12 +76,18 @@ impl PosixFsTemplateBuildFileStore {
         }
     }
 
-    /// Removes archives whose modification time is older than the retention
-    /// window. Runs opportunistically on import and scans a bounded number of
-    /// entries per call; failures only log.
+    /// Removes archives and abandoned import staging files whose modification
+    /// time is older than the retention window. Runs opportunistically on
+    /// import and scans a bounded number of entries per call; failures only
+    /// log.
     fn prune_expired(root: &Path) {
         let cutoff = SystemTime::now() - BUILD_FILE_RETENTION;
         Self::prune_dir_older_than(root, "tar", cutoff);
+        Self::prune_dir(root, "tmp", |path, modified| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".import-"))
+                && modified.is_some_and(|modified| modified < cutoff)
+        });
     }
 
     /// Removes upload grants that have passed their own `expires_unix`. Runs
@@ -673,6 +679,32 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with(".import-"))
             .count();
         assert_eq!(leftovers, 0, "import must not leak staging files");
+    }
+
+    #[tokio::test]
+    async fn import_prunes_expired_staging_files() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let store = PosixFsTemplateBuildFileStore::new(tempdir.path());
+        let store_dir = tempdir.path().join("template-build-files");
+        fs::create_dir_all(&store_dir).expect("create store dir");
+        let abandoned = store_dir.join(".import-abandoned.tmp");
+        fs::write(&abandoned, b"partial archive").expect("write abandoned import");
+        let stale = SystemTime::now() - BUILD_FILE_RETENTION - Duration::from_secs(60);
+        let file = fs::File::options()
+            .write(true)
+            .open(&abandoned)
+            .expect("open abandoned import");
+        file.set_times(fs::FileTimes::new().set_modified(stale))
+            .expect("set abandoned import mtime");
+        drop(file);
+
+        let staged = staged_file(tempdir.path(), b"tar-bytes");
+        store.import(HASH, &staged).await.expect("import");
+
+        assert!(
+            !abandoned.exists(),
+            "expired import staging files should be pruned"
+        );
     }
 
     #[tokio::test]
