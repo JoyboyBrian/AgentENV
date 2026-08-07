@@ -58,6 +58,24 @@ impl PosixFsTemplateBuildFileStore {
         })
     }
 
+    /// Checks whether the canonical archive path names a regular file without
+    /// following a final-component symlink. Unexpected object types indicate a
+    /// corrupt repository entry rather than a cache miss.
+    fn archive_exists(path: &Path) -> RepositoryResult<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+            Ok(_) => Err(RepositoryError::Backend {
+                message: format!("build archive '{}' is not a regular file", path.display()),
+                source: None,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(RepositoryError::backend(
+                format!("stat build archive '{}'", path.display()),
+                error,
+            )),
+        }
+    }
+
     /// Removes archives whose modification time is older than the retention
     /// window. Runs opportunistically on import and scans a bounded number of
     /// entries per call; failures only log.
@@ -242,18 +260,9 @@ impl PosixFsTemplateBuildFileStore {
 impl TemplateBuildFileStore for PosixFsTemplateBuildFileStore {
     async fn exists(&self, hash: &str) -> RepositoryResult<bool> {
         let path = self.archive_path(hash)?;
-        task::spawn_blocking(move || -> RepositoryResult<bool> {
-            match fs::metadata(&path) {
-                Ok(_) => Ok(true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                Err(error) => Err(RepositoryError::backend(
-                    format!("stat build archive '{}'", path.display()),
-                    error,
-                )),
-            }
-        })
-        .await
-        .map_err(|error| RepositoryError::backend("join build file exists task", error))?
+        task::spawn_blocking(move || Self::archive_exists(&path))
+            .await
+            .map_err(|error| RepositoryError::backend("join build file exists task", error))?
     }
 
     async fn import(&self, hash: &str, staged: &Path) -> RepositoryResult<()> {
@@ -263,7 +272,7 @@ impl TemplateBuildFileStore for PosixFsTemplateBuildFileStore {
         task::spawn_blocking(move || -> RepositoryResult<()> {
             // Archives are immutable: the hash addresses the content, so a
             // repeat upload cannot change what an in-flight build reads.
-            if final_path.exists() {
+            if Self::archive_exists(&final_path)? {
                 return Ok(());
             }
             Self::ensure_root(&root)?;
@@ -291,7 +300,13 @@ impl TemplateBuildFileStore for PosixFsTemplateBuildFileStore {
             // wins and everyone else observes `AlreadyExists`.
             let published = match fs::hard_link(&store_staged, &final_path) {
                 Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    match Self::archive_exists(&final_path) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(RepositoryError::backend("publish build archive", error)),
+                        Err(error) => Err(error),
+                    }
+                }
                 Err(error) => Err(RepositoryError::backend("publish build archive", error)),
             };
             if published.is_ok() {
@@ -319,17 +334,11 @@ impl TemplateBuildFileStore for PosixFsTemplateBuildFileStore {
     ) -> RepositoryResult<Option<PathBuf>> {
         let path = self.archive_path(hash)?;
         task::spawn_blocking(move || -> RepositoryResult<Option<PathBuf>> {
-            match fs::metadata(&path) {
-                Ok(_) => {
-                    Self::touch(&path);
-                    Ok(Some(path))
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(RepositoryError::backend(
-                    format!("stat build archive '{}'", path.display()),
-                    error,
-                )),
+            if !Self::archive_exists(&path)? {
+                return Ok(None);
             }
+            Self::touch(&path);
+            Ok(Some(path))
         })
         .await
         .map_err(|error| RepositoryError::backend("join build file materialize task", error))?
@@ -464,6 +473,60 @@ mod tests {
             .await
             .expect_err("invalid hash should fail");
         assert!(matches!(err, RepositoryError::InvalidRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn rejects_directory_at_archive_path() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let store = PosixFsTemplateBuildFileStore::new(tempdir.path());
+        let archive = tempdir
+            .path()
+            .join("template-build-files")
+            .join(format!("{HASH}.tar"));
+        fs::create_dir_all(&archive).expect("create archive directory");
+        let staged = staged_file(tempdir.path(), b"tar-bytes");
+
+        assert!(matches!(
+            store.exists(HASH).await,
+            Err(RepositoryError::Backend { .. })
+        ));
+        assert!(matches!(
+            store.import(HASH, &staged).await,
+            Err(RepositoryError::Backend { .. })
+        ));
+        assert!(matches!(
+            store.materialize(HASH, tempdir.path()).await,
+            Err(RepositoryError::Backend { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_symlink_at_archive_path() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = TempDir::new().expect("tempdir");
+        let store = PosixFsTemplateBuildFileStore::new(tempdir.path());
+        let store_dir = tempdir.path().join("template-build-files");
+        fs::create_dir_all(&store_dir).expect("create store directory");
+        let target = tempdir.path().join("target.tar");
+        fs::write(&target, b"redirected").expect("write symlink target");
+        let archive = store_dir.join(format!("{HASH}.tar"));
+        symlink(&target, &archive).expect("create archive symlink");
+        let staged = staged_file(tempdir.path(), b"tar-bytes");
+
+        assert!(matches!(
+            store.exists(HASH).await,
+            Err(RepositoryError::Backend { .. })
+        ));
+        assert!(matches!(
+            store.import(HASH, &staged).await,
+            Err(RepositoryError::Backend { .. })
+        ));
+        assert!(matches!(
+            store.materialize(HASH, tempdir.path()).await,
+            Err(RepositoryError::Backend { .. })
+        ));
     }
 
     #[tokio::test]
