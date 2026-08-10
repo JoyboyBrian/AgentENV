@@ -23,9 +23,6 @@ use crate::snapshot::{
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use crate::virtualization::VirtualizationMode;
 
-/// Default command to use for ready check when start command is provided but ready command is not.
-/// Use the same default ready command as E2B
-const DEFAULT_READY_WITH_START_CMD: &str = "sleep 20";
 const READY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const READY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -442,15 +439,7 @@ fn prepare_startup(
     //         })
     // });
 
-    let mut startup = startup?;
-    let start_cmd_empty = startup.start_cmd.trim().is_empty();
-    let ready_cmd_empty = startup.ready_cmd.trim().is_empty();
-    if start_cmd_empty && ready_cmd_empty {
-        return None;
-    }
-    if !start_cmd_empty && ready_cmd_empty {
-        startup.ready_cmd = DEFAULT_READY_WITH_START_CMD.to_string();
-    }
+    let mut startup = startup?.normalized()?;
     if override_startup {
         startup.context = build_context.clone();
     }

@@ -11,7 +11,7 @@ pub use snapshot::{
     CommandContext, CommittedSnapshot, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
     PersistedDiskImagePublication, RunnableSnapshot, SnapshotPublishMetadata,
     SnapshotPublishSource, SnapshotRecord, SnapshotSource, SnapshotSourceKind, StartupCommand,
-    TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
+    TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus, DEFAULT_READY_WITH_START_CMD,
 };
 pub use value::{SnapshotAlias, SnapshotId};
 pub use version::SnapshotRuntimeVersions;

@@ -20,6 +20,7 @@ use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{
     CommandContext, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
+    StartupCommand,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use agentenv_http_server::apis::sandboxes::*;
@@ -32,6 +33,52 @@ use super::ApiImpl;
 
 fn sandbox_not_found(id: impl Into<String>) -> models::Error {
     ApiImpl::error(404, format!("sandbox {} not found", id.into()))
+}
+
+fn snapshot_context_from_model(model: &models::SandboxSnapshotContext) -> CommandContext {
+    CommandContext::new(
+        model.env_vars.clone().unwrap_or_default(),
+        model.workdir.clone().unwrap_or_default(),
+    )
+    .with_user(model.user.clone().filter(|user| !user.is_empty()))
+    .with_exposed_ports(model.exposed_ports.clone().unwrap_or_default())
+    .with_entrypoint(model.entrypoint.clone())
+    .with_cmd(model.cmd.clone())
+    .with_volumes(model.volumes.clone().unwrap_or_default())
+    .with_labels(model.labels.clone().unwrap_or_default())
+}
+
+/// Resolves the context and startup metadata stored with a snapshot published
+/// from a running sandbox. A request-supplied final context replaces the
+/// captured context wholesale, and any surviving startup command embeds that
+/// same context so a snapshot never carries two diverging contexts. The
+/// override applies only to publishing; captured sandbox state is not
+/// modified.
+fn resolve_capture_publish_metadata(
+    body: &models::SandboxSnapshotRequest,
+    captured_context: CommandContext,
+    captured_startup: Option<StartupCommand>,
+) -> (CommandContext, Option<StartupCommand>) {
+    let context = match &body.final_context {
+        Some(model) => snapshot_context_from_model(model),
+        None => captured_context,
+    };
+    let startup = if body.start_cmd.is_some() || body.ready_cmd.is_some() {
+        StartupCommand {
+            start_cmd: body.start_cmd.clone().unwrap_or_default(),
+            ready_cmd: body.ready_cmd.clone().unwrap_or_default(),
+            context: context.clone(),
+        }
+        .normalized()
+    } else if body.final_context.is_some() {
+        captured_startup.map(|startup| StartupCommand {
+            context: context.clone(),
+            ..startup
+        })
+    } else {
+        captured_startup
+    };
+    (context, startup)
 }
 
 fn default_sandbox_timeout() -> Duration {
@@ -1119,6 +1166,11 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
 
+        let (context, startup) = resolve_capture_publish_metadata(
+            body,
+            capture.metadata.context.clone(),
+            capture.metadata.startup.clone(),
+        );
         let published = match timer
             .time(
                 "publish",
@@ -1129,8 +1181,8 @@ impl Sandboxes<()> for ApiImpl {
                         source: SnapshotPublishSource::Sandbox {
                             source_sandbox_id: capture.metadata.id.to_string(),
                         },
-                        context: capture.metadata.context.clone(),
-                        startup: capture.metadata.startup.clone(),
+                        context,
+                        startup,
                         resources: capture.metadata.resources,
                         runtime_versions: capture.metadata.runtime_versions.clone(),
                         virtualization_mode: capture.metadata.virtualization_mode,
@@ -1497,5 +1549,149 @@ mod tests {
             .expect("empty update should be valid");
 
         assert_eq!(policy, SandboxNetworkPolicy::default());
+    }
+
+    fn captured_context() -> CommandContext {
+        CommandContext::new(
+            HashMap::from([("BASE".to_string(), "1".to_string())]),
+            "/captured",
+        )
+        .with_user(Some("captured-user".to_string()))
+        .with_labels(HashMap::from([("k".to_string(), "v".to_string())]))
+    }
+
+    fn captured_startup() -> StartupCommand {
+        StartupCommand {
+            start_cmd: "echo captured".to_string(),
+            ready_cmd: "echo ready".to_string(),
+            context: captured_context(),
+        }
+    }
+
+    #[test]
+    fn capture_publish_without_overrides_keeps_captured_metadata() {
+        let body = models::SandboxSnapshotRequest::new();
+
+        let (context, startup) =
+            resolve_capture_publish_metadata(&body, captured_context(), Some(captured_startup()));
+
+        assert_eq!(context, captured_context());
+        assert_eq!(startup, Some(captured_startup()));
+    }
+
+    #[test]
+    fn capture_publish_final_context_replaces_wholesale() {
+        let mut body = models::SandboxSnapshotRequest::new();
+        body.final_context = Some(models::SandboxSnapshotContext {
+            env_vars: Some(HashMap::from([("NEW".to_string(), "2".to_string())])),
+            workdir: Some("/final".to_string()),
+            user: Some("final-user".to_string()),
+            entrypoint: Some(vec!["/bin/app".to_string()]),
+            cmd: None,
+            exposed_ports: None,
+            volumes: None,
+            labels: None,
+        });
+
+        let (context, startup) = resolve_capture_publish_metadata(&body, captured_context(), None);
+
+        // Wholesale replacement: captured env vars and labels do not survive.
+        assert_eq!(
+            context.env_vars,
+            HashMap::from([("NEW".to_string(), "2".to_string())])
+        );
+        assert_eq!(context.workdir, "/final");
+        assert_eq!(context.user.as_deref(), Some("final-user"));
+        assert_eq!(context.entrypoint, Some(vec!["/bin/app".to_string()]));
+        assert!(context.labels.is_empty());
+        assert_eq!(startup, None);
+    }
+
+    #[test]
+    fn capture_publish_final_context_reembeds_captured_startup_context() {
+        let mut body = models::SandboxSnapshotRequest::new();
+        body.final_context = Some(models::SandboxSnapshotContext {
+            env_vars: None,
+            workdir: Some("/final".to_string()),
+            user: None,
+            entrypoint: None,
+            cmd: None,
+            exposed_ports: None,
+            volumes: None,
+            labels: None,
+        });
+
+        let (context, startup) =
+            resolve_capture_publish_metadata(&body, captured_context(), Some(captured_startup()));
+
+        let startup = startup.expect("captured startup command should survive");
+        assert_eq!(startup.start_cmd, "echo captured");
+        assert_eq!(startup.ready_cmd, "echo ready");
+        assert_eq!(startup.context, context);
+    }
+
+    #[test]
+    fn capture_publish_start_cmd_replaces_startup_with_default_ready() {
+        let mut body = models::SandboxSnapshotRequest::new();
+        body.start_cmd = Some("python3 app.py".to_string());
+
+        let (context, startup) =
+            resolve_capture_publish_metadata(&body, captured_context(), Some(captured_startup()));
+
+        let startup = startup.expect("start command should produce startup metadata");
+        assert_eq!(startup.start_cmd, "python3 app.py");
+        assert_eq!(
+            startup.ready_cmd,
+            crate::snapshot::DEFAULT_READY_WITH_START_CMD
+        );
+        assert_eq!(startup.context, context);
+    }
+
+    #[test]
+    fn capture_publish_startup_context_derives_from_final_context() {
+        let mut body = models::SandboxSnapshotRequest::new();
+        body.final_context = Some(models::SandboxSnapshotContext {
+            env_vars: Some(HashMap::from([("A".to_string(), "1".to_string())])),
+            workdir: Some("/final".to_string()),
+            user: None,
+            entrypoint: None,
+            cmd: None,
+            exposed_ports: None,
+            volumes: None,
+            labels: None,
+        });
+        body.start_cmd = Some("run".to_string());
+        body.ready_cmd = Some("check".to_string());
+
+        let (context, startup) = resolve_capture_publish_metadata(&body, captured_context(), None);
+
+        let startup = startup.expect("startup metadata should be produced");
+        assert_eq!(startup.ready_cmd, "check");
+        assert_eq!(startup.context, context);
+        assert_eq!(startup.context.workdir, "/final");
+    }
+
+    #[test]
+    fn capture_publish_empty_start_and_ready_cmd_clear_startup() {
+        let mut body = models::SandboxSnapshotRequest::new();
+        body.start_cmd = Some(String::new());
+        body.ready_cmd = Some(String::new());
+
+        let (_, startup) =
+            resolve_capture_publish_metadata(&body, captured_context(), Some(captured_startup()));
+
+        assert_eq!(startup, None);
+    }
+
+    #[test]
+    fn capture_publish_normalizes_context_defaults() {
+        let mut body = models::SandboxSnapshotRequest::new();
+        body.final_context = Some(models::SandboxSnapshotContext::new());
+
+        let (context, _) = resolve_capture_publish_metadata(&body, captured_context(), None);
+
+        assert_eq!(context.workdir, "/");
+        assert_eq!(context.user, None);
+        assert!(context.env_vars.is_empty());
     }
 }

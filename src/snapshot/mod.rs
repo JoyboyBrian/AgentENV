@@ -16,5 +16,6 @@ pub use types::{
     OverlaybdLayerRef, PersistedDiskImagePublication, ResolvedAttachedDrive, RunnableSnapshot,
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
     SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind, StartupCommand,
-    TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus, SNAPSHOT_ARTIFACT_LAYOUT,
+    TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus, DEFAULT_READY_WITH_START_CMD,
+    SNAPSHOT_ARTIFACT_LAYOUT,
 };

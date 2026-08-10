@@ -3321,9 +3321,7 @@ impl std::str::FromStr for Node {
             let val = match string_iter.next() {
                 Some(x) => x,
                 None => {
-                    return std::result::Result::Err(
-                        "Missing value while parsing Node".to_string(),
-                    );
+                    return std::result::Result::Err("Missing value while parsing Node".to_string());
                 }
             };
 
@@ -6251,6 +6249,252 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxRefre
     }
 }
 
+/// Full command context stored with a published snapshot, mirroring the OCI image config fields AgentENV tracks. Omitted fields are stored as empty, not merged from the captured sandbox context.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxSnapshotContext {
+    #[serde(rename = "envVars")]
+    #[validate(custom(function = "check_xss_map_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_vars: Option<std::collections::HashMap<String, String>>,
+
+    /// Working directory. Empty is normalized to \"/\".
+    #[serde(rename = "workdir")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+
+    /// Default user. Empty is treated as unset.
+    #[serde(rename = "user")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    /// OCI image config style entrypoint.
+    #[serde(rename = "entrypoint")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Vec<String>>,
+
+    /// OCI image config style command.
+    #[serde(rename = "cmd")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<Vec<String>>,
+
+    #[serde(rename = "exposedPorts")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exposed_ports: Option<Vec<String>>,
+
+    #[serde(rename = "volumes")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volumes: Option<Vec<String>>,
+
+    #[serde(rename = "labels")]
+    #[validate(custom(function = "check_xss_map_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<std::collections::HashMap<String, String>>,
+}
+
+impl SandboxSnapshotContext {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new() -> SandboxSnapshotContext {
+        SandboxSnapshotContext {
+            env_vars: None,
+            workdir: None,
+            user: None,
+            entrypoint: None,
+            cmd: None,
+            exposed_ports: None,
+            volumes: None,
+            labels: None,
+        }
+    }
+}
+
+/// Converts the SandboxSnapshotContext value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxSnapshotContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping envVars in query parameter serialization
+            self.workdir
+                .as_ref()
+                .map(|workdir| ["workdir".to_string(), workdir.to_string()].join(",")),
+            self.user
+                .as_ref()
+                .map(|user| ["user".to_string(), user.to_string()].join(",")),
+            self.entrypoint.as_ref().map(|entrypoint| {
+                [
+                    "entrypoint".to_string(),
+                    entrypoint
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ]
+                .join(",")
+            }),
+            self.cmd.as_ref().map(|cmd| {
+                [
+                    "cmd".to_string(),
+                    cmd.iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ]
+                .join(",")
+            }),
+            self.exposed_ports.as_ref().map(|exposed_ports| {
+                [
+                    "exposedPorts".to_string(),
+                    exposed_ports
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ]
+                .join(",")
+            }),
+            self.volumes.as_ref().map(|volumes| {
+                [
+                    "volumes".to_string(),
+                    volumes
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ]
+                .join(",")
+            }),
+            // Skipping labels in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxSnapshotContext value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxSnapshotContext {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub env_vars: Vec<std::collections::HashMap<String, String>>,
+            pub workdir: Vec<String>,
+            pub user: Vec<String>,
+            pub entrypoint: Vec<Vec<String>>,
+            pub cmd: Vec<Vec<String>>,
+            pub exposed_ports: Vec<Vec<String>>,
+            pub volumes: Vec<Vec<String>>,
+            pub labels: Vec<std::collections::HashMap<String, String>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxSnapshotContext".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    "envVars" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxSnapshotContext".to_string()),
+                    #[allow(clippy::redundant_clone)]
+                    "workdir" => intermediate_rep.workdir.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "user" => intermediate_rep.user.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    "entrypoint" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxSnapshotContext".to_string()),
+                    "cmd" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxSnapshotContext".to_string()),
+                    "exposedPorts" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxSnapshotContext".to_string()),
+                    "volumes" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxSnapshotContext".to_string()),
+                    "labels" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxSnapshotContext".to_string()),
+                    _ => return std::result::Result::Err("Unexpected key while parsing SandboxSnapshotContext".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxSnapshotContext {
+            env_vars: intermediate_rep.env_vars.into_iter().next(),
+            workdir: intermediate_rep.workdir.into_iter().next(),
+            user: intermediate_rep.user.into_iter().next(),
+            entrypoint: intermediate_rep.entrypoint.into_iter().next(),
+            cmd: intermediate_rep.cmd.into_iter().next(),
+            exposed_ports: intermediate_rep.exposed_ports.into_iter().next(),
+            volumes: intermediate_rep.volumes.into_iter().next(),
+            labels: intermediate_rep.labels.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxSnapshotContext> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxSnapshotContext>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxSnapshotContext>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxSnapshotContext - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxSnapshotContext> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxSnapshotContext as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxSnapshotContext - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxSnapshotRequest {
@@ -6259,12 +6503,35 @@ pub struct SandboxSnapshotRequest {
     #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+
+    /// Optional final command context for the published snapshot. When present it replaces the captured sandbox context wholesale (no field-level merging). The override applies only while publishing the snapshot; the live sandbox runtime state is not modified.
+    #[serde(rename = "finalContext")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_context: Option<models::SandboxSnapshotContext>,
+
+    /// Optional start command stored with the published snapshot. When startCmd or readyCmd is provided, they replace the captured startup metadata; providing both as empty strings clears it. The startup command context is derived from the final context applied to the snapshot.
+    #[serde(rename = "startCmd")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_cmd: Option<String>,
+
+    /// Optional ready check command stored with the published snapshot. Defaults to the standard ready wait when only startCmd is provided.
+    #[serde(rename = "readyCmd")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_cmd: Option<String>,
 }
 
 impl SandboxSnapshotRequest {
     #[allow(clippy::new_without_default, clippy::too_many_arguments)]
     pub fn new() -> SandboxSnapshotRequest {
-        SandboxSnapshotRequest { name: None }
+        SandboxSnapshotRequest {
+            name: None,
+            final_context: None,
+            start_cmd: None,
+            ready_cmd: None,
+        }
     }
 }
 
@@ -6277,6 +6544,13 @@ impl std::fmt::Display for SandboxSnapshotRequest {
             self.name
                 .as_ref()
                 .map(|name| ["name".to_string(), name.to_string()].join(",")),
+            // Skipping finalContext in query parameter serialization
+            self.start_cmd
+                .as_ref()
+                .map(|start_cmd| ["startCmd".to_string(), start_cmd.to_string()].join(",")),
+            self.ready_cmd
+                .as_ref()
+                .map(|ready_cmd| ["readyCmd".to_string(), ready_cmd.to_string()].join(",")),
         ];
 
         write!(
@@ -6299,6 +6573,9 @@ impl std::str::FromStr for SandboxSnapshotRequest {
         #[allow(dead_code)]
         struct IntermediateRep {
             pub name: Vec<String>,
+            pub final_context: Vec<models::SandboxSnapshotContext>,
+            pub start_cmd: Vec<String>,
+            pub ready_cmd: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -6324,6 +6601,19 @@ impl std::str::FromStr for SandboxSnapshotRequest {
                     "name" => intermediate_rep.name.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "finalContext" => intermediate_rep.final_context.push(
+                        <models::SandboxSnapshotContext as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "startCmd" => intermediate_rep.start_cmd.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "readyCmd" => intermediate_rep.ready_cmd.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing SandboxSnapshotRequest".to_string(),
@@ -6339,6 +6629,9 @@ impl std::str::FromStr for SandboxSnapshotRequest {
         // Use the intermediate representation to return the struct
         std::result::Result::Ok(SandboxSnapshotRequest {
             name: intermediate_rep.name.into_iter().next(),
+            final_context: intermediate_rep.final_context.into_iter().next(),
+            start_cmd: intermediate_rep.start_cmd.into_iter().next(),
+            ready_cmd: intermediate_rep.ready_cmd.into_iter().next(),
         })
     }
 }

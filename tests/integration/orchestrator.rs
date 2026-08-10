@@ -281,3 +281,113 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
     .await
     .map_err(|_| anyhow::anyhow!("test timed out"))?
 }
+
+/// Publishing a captured sandbox with a replaced final context must store that
+/// context wholesale (no merging with the captured context) and embed the same
+/// context in the startup command, mirroring what the snapshot API does when a
+/// `finalContext`/`startCmd` override is supplied at capture time.
+#[tokio::test]
+async fn orchestrator_capture_publish_with_final_context_override_persists() -> Result<()> {
+    common::setup().await;
+    timeout(TEST_TIMEOUT, async {
+        let root = tempdir()?;
+        let (builder, snapshot_manager, _) = common::snapshot_test_parts(root.path());
+        let base_alias = format!("orchestrator-override-base-{}", Uuid::now_v7());
+
+        let stored = builder
+            .build_and_publish(
+                &snapshot_manager,
+                common::default_rootfs_template_build_spec()
+                    .alias(base_alias)
+                    .env("CAPTURED_ONLY", "should-not-survive")
+                    .workdir("/captured"),
+            )
+            .await?;
+        let runnable = snapshot_manager.resolve_runnable(stored).await?;
+
+        let orchestrator = Orchestrator::with_in_memory_store().await;
+        let created = orchestrator
+            .create_sandbox(CreateSandboxRequest {
+                source: SandboxLaunchSource::Snapshot(Box::new(runnable)),
+                timeout: Some(Duration::from_secs(30)),
+                timeout_action: SandboxTimeoutAction::Pause,
+                user_metadata: None,
+                env_vars: None,
+                network_policy: SandboxNetworkPolicy::default(),
+                auto_resume: false,
+                custom_extension_params: None,
+            })
+            .await?;
+        let sandbox_id = created.id;
+        let capture = orchestrator.capture_snapshot(sandbox_id).await?;
+
+        let final_context = agentenv::snapshot::CommandContext::new(
+            std::collections::HashMap::from([("FINAL_ENV".to_string(), "kept".to_string())]),
+            "/final",
+        )
+        .with_user(Some("root".to_string()));
+        let final_startup = StartupCommand {
+            start_cmd: "sleep 1000000".to_string(),
+            ready_cmd: "true".to_string(),
+            context: final_context.clone(),
+        };
+
+        let published_alias = format!("orchestrator-override-{}", Uuid::now_v7());
+        let published = snapshot_manager
+            .publish_captured(
+                SnapshotPublishMetadata {
+                    id: SnapshotId::generate(),
+                    alias: Some(SnapshotAlias::parse(&published_alias)?),
+                    source: SnapshotPublishSource::Sandbox {
+                        source_sandbox_id: sandbox_id.to_string(),
+                    },
+                    context: final_context.clone(),
+                    startup: Some(final_startup.clone()),
+                    resources: capture.metadata.resources,
+                    runtime_versions: capture.metadata.runtime_versions.clone(),
+                    virtualization_mode: capture.metadata.virtualization_mode,
+                    image_configs: capture.metadata.image_configs.clone(),
+                    custom_extension_params: None,
+                },
+                capture.captured_snapshot,
+            )
+            .await?;
+
+        let record = snapshot_manager
+            .get(published.id.to_string())
+            .await?
+            .expect("published snapshot record should exist");
+        let committed = record
+            .committed
+            .as_ref()
+            .expect("published snapshot should be committed");
+        assert_eq!(committed.context, final_context);
+        assert!(!committed.context.env_vars.contains_key("CAPTURED_ONLY"));
+        assert_eq!(committed.startup.as_ref(), Some(&final_startup));
+        assert_eq!(
+            committed.startup.as_ref().map(|startup| &startup.context),
+            Some(&final_context)
+        );
+
+        let captured_runnable = snapshot_manager.resolve_runnable(published).await?;
+        let relaunched = orchestrator
+            .create_sandbox(CreateSandboxRequest {
+                source: SandboxLaunchSource::Snapshot(Box::new(captured_runnable)),
+                timeout: Some(Duration::from_secs(30)),
+                timeout_action: SandboxTimeoutAction::Pause,
+                user_metadata: None,
+                env_vars: None,
+                network_policy: SandboxNetworkPolicy::default(),
+                auto_resume: false,
+                custom_extension_params: None,
+            })
+            .await?;
+        assert_eq!(relaunched.state, SandboxState::Running);
+
+        orchestrator.delete_sandbox(relaunched.id).await?;
+        orchestrator.delete_sandbox(sandbox_id).await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("test timed out"))?
+}

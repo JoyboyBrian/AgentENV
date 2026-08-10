@@ -274,11 +274,32 @@ fn normalize_workdir(workdir: String) -> String {
     }
 }
 
+/// Default ready check used when a start command is configured without an
+/// explicit ready command.
+pub const DEFAULT_READY_WITH_START_CMD: &str = "sleep 20";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupCommand {
     pub start_cmd: String,
     pub ready_cmd: String,
     pub context: CommandContext,
+}
+
+impl StartupCommand {
+    /// Normalizes a startup command: both commands empty means no startup at
+    /// all, and a start command without a ready command gets the default
+    /// ready wait.
+    pub fn normalized(mut self) -> Option<Self> {
+        let start_cmd_empty = self.start_cmd.trim().is_empty();
+        let ready_cmd_empty = self.ready_cmd.trim().is_empty();
+        if start_cmd_empty && ready_cmd_empty {
+            return None;
+        }
+        if !start_cmd_empty && ready_cmd_empty {
+            self.ready_cmd = DEFAULT_READY_WITH_START_CMD.to_string();
+        }
+        Some(self)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

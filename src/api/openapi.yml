@@ -653,6 +653,66 @@ components:
         name:
           type: string
           description: Optional name for the snapshot template. If a snapshot template with this name already exists, a new build will be assigned to the existing template instead of creating a new one.
+        finalContext:
+          allOf:
+            - $ref: "#/components/schemas/SandboxSnapshotContext"
+          description: >-
+            Optional final command context for the published snapshot. When
+            present it replaces the captured sandbox context wholesale (no
+            field-level merging). The override applies only while publishing
+            the snapshot; the live sandbox runtime state is not modified.
+        startCmd:
+          type: string
+          description: >-
+            Optional start command stored with the published snapshot. When
+            startCmd or readyCmd is provided, they replace the captured
+            startup metadata; providing both as empty strings clears it. The
+            startup command context is derived from the final context applied
+            to the snapshot.
+        readyCmd:
+          type: string
+          description: >-
+            Optional ready check command stored with the published snapshot.
+            Defaults to the standard ready wait when only startCmd is
+            provided.
+
+    SandboxSnapshotContext:
+      type: object
+      description: >-
+        Full command context stored with a published snapshot, mirroring the
+        OCI image config fields AgentENV tracks. Omitted fields are stored as
+        empty, not merged from the captured sandbox context.
+      properties:
+        envVars:
+          $ref: "#/components/schemas/EnvVars"
+        workdir:
+          type: string
+          description: Working directory. Empty is normalized to "/".
+        user:
+          type: string
+          description: Default user. Empty is treated as unset.
+        entrypoint:
+          type: array
+          items:
+            type: string
+          description: OCI image config style entrypoint.
+        cmd:
+          type: array
+          items:
+            type: string
+          description: OCI image config style command.
+        exposedPorts:
+          type: array
+          items:
+            type: string
+        volumes:
+          type: array
+          items:
+            type: string
+        labels:
+          type: object
+          additionalProperties:
+            type: string
 
     SandboxForkRequest:
       type: object
