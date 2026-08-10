@@ -162,10 +162,29 @@ impl Transport {
         Resp::decode(bytes).context("decoding unary response")
     }
 
+    /// Builds a Connect server-stream request. The execution user is carried
+    /// the same way as on the unary path: HTTP Basic auth with the username
+    /// and no password, resolved by envd inside the sandbox.
+    fn stream_request(
+        &self,
+        http: &HttpClient,
+        method: &str,
+        username: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        let request = self
+            .auth(http.post(self.url(PROCESS_SERVICE, method)))
+            .header("Content-Type", "application/connect+proto");
+        match username {
+            Some(username) => request.basic_auth(username, Option::<&str>::None),
+            None => request,
+        }
+    }
+
     pub async fn server_stream<Req, Resp>(
         &self,
         method: &str,
         req: Req,
+        username: Option<&str>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Resp>> + Send>>>
     where
         Req: Message,
@@ -174,8 +193,7 @@ impl Transport {
         let initial = encode_envelope(FLAG_DATA, &req.encode_to_vec());
         let http = Self::http_client(&self.base_url)?;
         let resp = self
-            .auth(http.post(self.url(PROCESS_SERVICE, method)))
-            .header("Content-Type", "application/connect+proto")
+            .stream_request(&http, method, username)
             .body(initial)
             .send()
             .await
@@ -380,6 +398,9 @@ pub struct StartOpts<'a> {
     pub envs: std::collections::HashMap<String, String>,
     pub pty: Option<(u32, u32)>,
     pub stdin: bool,
+    /// Working directory for the process; envd falls back to its default
+    /// workdir (and then the user home) when unset.
+    pub cwd: Option<String>,
 }
 
 pub fn build_start_request(opts: StartOpts<'_>) -> StartRequest {
@@ -388,7 +409,7 @@ pub fn build_start_request(opts: StartOpts<'_>) -> StartRequest {
             cmd: opts.cmd.to_string(),
             args: opts.args,
             envs: opts.envs,
-            cwd: None,
+            cwd: opts.cwd,
         }),
         pty: opts.pty.map(|(cols, rows)| Pty {
             size: Some(envd::process::pty::Size { cols, rows }),
@@ -510,6 +531,31 @@ mod tests {
 
         let request = transport
             .unary_request("filesystem.Filesystem", "Stat", None)
+            .build()
+            .unwrap();
+        assert!(!request.headers().contains_key(AUTHORIZATION));
+    }
+
+    #[test]
+    fn stream_user_is_sent_as_basic_auth_like_unary() {
+        let transport = Transport::new("http://127.0.0.1", "api-key", "sandbox-id").unwrap();
+        let http = Transport::http_client("http://127.0.0.1").unwrap();
+
+        let request = transport
+            .stream_request(&http, "Start", Some("app"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers().get(AUTHORIZATION).unwrap(),
+            "Basic YXBwOg=="
+        );
+        assert_eq!(
+            request.headers().get("Content-Type").unwrap(),
+            "application/connect+proto"
+        );
+
+        let request = transport
+            .stream_request(&http, "Start", None)
             .build()
             .unwrap();
         assert!(!request.headers().contains_key(AUTHORIZATION));

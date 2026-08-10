@@ -64,9 +64,10 @@ pub(crate) async fn attach(client: &Client, sandbox_id: &str) -> Result<i32> {
             envs: pty_envs(),
             pty: Some((cols, rows)),
             stdin: true,
+            cwd: None,
         });
         let mut stream = match transport
-            .server_stream::<_, StartResponse>("Start", req)
+            .server_stream::<_, StartResponse>("Start", req, None)
             .await
         {
             Ok(stream) => stream,
@@ -540,6 +541,7 @@ async fn open_output_connection(
             ConnectRequest {
                 process: Some(selector),
             },
+            None,
         )
         .await
 }

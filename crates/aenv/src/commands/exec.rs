@@ -34,10 +34,11 @@ async fn run_async(client: Client, args: Args) -> Result<i32> {
         envs: Default::default(),
         pty: None,
         stdin: false,
+        cwd: None,
     });
 
     let stream = transport
-        .server_stream::<_, StartResponse>("Start", req)
+        .server_stream::<_, StartResponse>("Start", req, None)
         .await?;
     drain_output(stream).await
 }
