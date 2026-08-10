@@ -9,38 +9,46 @@
 //! escape the destination.
 
 use anyhow::{anyhow, bail, Context, Result};
+use cap_fs_ext::{
+    FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt, OpenOptionsSyncExt, OsMetadataExt,
+};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, File as CapabilityFile, Metadata as CapabilityMetadata, OpenOptions};
+use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use walkdir::WalkDir;
+use std::sync::Arc;
+
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FileFullDirectoryInfo, FileFullDirectoryRestartInfo, GetFileInformationByHandleEx,
+    FILE_FULL_DIR_INFO,
+};
 
 const DOCKERIGNORE_FILE: &str = ".dockerignore";
 
 pub(crate) struct BuildContext {
-    root: PathBuf,
+    root: Arc<ContextRoot>,
     ignore: IgnoreRules,
 }
 
 impl BuildContext {
     pub(crate) fn load(root: &Path) -> Result<Self> {
-        let metadata = std::fs::metadata(root)
-            .with_context(|| format!("reading build context {}", root.display()))?;
-        if !metadata.is_dir() {
-            bail!(
-                "build context must be a directory: {} (pass the Dockerfile with -f and the \
-                 context directory as the positional argument)",
-                root.display()
-            );
-        }
-        let root = root
-            .canonicalize()
-            .with_context(|| format!("resolving build context {}", root.display()))?;
-        let ignore = match std::fs::read_to_string(root.join(DOCKERIGNORE_FILE)) {
+        let root = Arc::new(ContextRoot::open(root)?);
+        let dockerignore = ContextPath::new(root.clone(), PathBuf::from(DOCKERIGNORE_FILE))?;
+        let ignore = match dockerignore.read_to_string() {
             Ok(text) => IgnoreRules::parse(&text)
-                .with_context(|| format!("parsing {}", root.join(DOCKERIGNORE_FILE).display()))?,
+                .with_context(|| format!("parsing {}", dockerignore.display()))?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => IgnoreRules::default(),
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("reading {}", root.join(DOCKERIGNORE_FILE).display()))
+                return Err(err).with_context(|| format!("reading {}", dockerignore.display()))
             }
         };
         Ok(Self { root, ignore })
@@ -48,7 +56,7 @@ impl BuildContext {
 
     #[cfg(test)]
     pub(crate) fn root(&self) -> &Path {
-        &self.root
+        &self.root.display
     }
 
     /// Selects the local sources for one COPY/ADD instruction. Globs are
@@ -72,36 +80,40 @@ impl BuildContext {
     }
 
     fn select_exact(&self, original: &str, normalized: &str) -> Result<SelectedSource> {
-        let relative = PathBuf::from(normalized);
-        let path = if normalized == "." {
-            self.root.clone()
+        let relative = if normalized == "." {
+            PathBuf::new()
         } else {
-            self.root.join(&relative)
+            PathBuf::from(normalized)
         };
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
+        let path = ContextPath::new(self.root.clone(), relative.clone())?;
+        let opened = match path.open_node_io() {
+            Ok(opened) => opened,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 bail!("source {original:?} was not found in the build context");
             }
             Err(err) => {
-                return Err(err).with_context(|| format!("reading source {original:?}"));
+                bail!(
+                    "opening source {original:?} without following symbolic links or reparse \
+                     points: {err}"
+                );
             }
         };
-        if normalized != "." && self.ignore.is_ignored(&relative, metadata.is_dir()) {
+        let is_dir = opened.is_dir();
+        if normalized != "." && self.ignore.is_ignored(&relative, is_dir) {
             bail!("source {original:?} is excluded by {DOCKERIGNORE_FILE}");
         }
-        validate_source_file_type(&path, &metadata)?;
         Ok(SelectedSource {
             path,
             relative,
-            is_dir: metadata.is_dir(),
+            is_dir,
         })
     }
 
     fn select_glob(&self, pattern: &str) -> Result<Vec<SelectedSource>> {
         let segments = pattern_segments(pattern)?;
         let mut matches = Vec::new();
-        for entry in self.walk_filtered(&self.root)? {
+        let root = ContextPath::new(self.root.clone(), PathBuf::new())?;
+        for entry in self.walk_filtered(&root)? {
             let relative_segments: Vec<&str> = entry
                 .relative
                 .iter()
@@ -129,59 +141,86 @@ impl BuildContext {
     /// Walks a directory, skipping ignored paths, rejecting symlinks and
     /// special files, and enforcing UTF-8 names. Returned paths are relative
     /// to the context root.
-    fn walk_filtered(&self, dir: &Path) -> Result<Vec<SelectedSource>> {
+    fn walk_filtered(&self, dir: &ContextPath) -> Result<Vec<SelectedSource>> {
+        self.walk_filtered_impl(dir, |_, _| Ok(()))
+    }
+
+    fn walk_filtered_impl<F>(
+        &self,
+        dir: &ContextPath,
+        mut after_open: F,
+    ) -> Result<Vec<SelectedSource>>
+    where
+        F: FnMut(&ContextPath, bool) -> Result<()>,
+    {
+        let opened = dir.open_node().with_context(|| {
+            format!(
+                "opening directory {} without following symbolic links or reparse points",
+                dir.display()
+            )
+        })?;
+        let OpenedNode::Directory(directory) = opened else {
+            bail!("source is no longer a directory: {}", dir.display());
+        };
         let mut entries = Vec::new();
-        let mut walker = WalkDir::new(dir)
-            .follow_links(false)
-            .min_depth(1)
-            .sort_by_file_name()
-            .into_iter();
-        while let Some(entry) = walker.next() {
-            let entry = entry.with_context(|| format!("walking {}", dir.display()))?;
-            let file_type = entry.file_type();
-            let relative = entry
-                .path()
-                .strip_prefix(&self.root)
-                .expect("walked entries stay under the context root")
-                .to_path_buf();
-            for component in relative.components() {
-                let Component::Normal(part) = component else {
-                    bail!("invalid context path: {}", relative.display());
-                };
-                if part.to_str().is_none() {
-                    bail!(
-                        "context entries must have valid UTF-8 names: {}",
-                        entry.path().display()
-                    );
-                }
-            }
-            if self.ignore.is_ignored(&relative, file_type.is_dir()) {
-                // A fully ignored directory can be pruned unless a negation
-                // pattern could re-include something beneath it.
-                if file_type.is_dir() && !self.ignore.has_negations() {
-                    walker.skip_current_dir();
-                }
-                continue;
-            }
-            if file_type.is_symlink() {
-                bail!(
-                    "symbolic links are not supported in the build context: {}",
-                    entry.path().display()
-                );
-            }
-            if !file_type.is_dir() && !file_type.is_file() {
-                bail!(
-                    "special files are not supported in the build context: {}",
-                    entry.path().display()
-                );
-            }
-            entries.push(SelectedSource {
-                path: entry.path().to_path_buf(),
-                relative,
-                is_dir: file_type.is_dir(),
-            });
-        }
+        self.walk_open_dir(directory, &dir.relative, &mut entries, &mut after_open)?;
         Ok(entries)
+    }
+
+    fn walk_open_dir<F>(
+        &self,
+        directory: Dir,
+        relative_dir: &Path,
+        entries: &mut Vec<SelectedSource>,
+        after_open: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&ContextPath, bool) -> Result<()>,
+    {
+        let mut names = directory_entry_names(&directory).with_context(|| {
+            format!("walking {}", self.root.display_path(relative_dir).display())
+        })?;
+        names.sort();
+
+        for name in names {
+            validate_context_name(&name)?;
+            let relative = relative_dir.join(&name);
+            let path = ContextPath::new(self.root.clone(), relative.clone())?;
+            let opened = open_child_nofollow(&directory, &name).with_context(|| {
+                format!(
+                    "opening context entry {} without following symbolic links or reparse points",
+                    path.display()
+                )
+            })?;
+            let is_dir = opened.is_dir();
+            after_open(&path, is_dir)?;
+
+            let ignored = self.ignore.is_ignored(&relative, is_dir);
+            match opened {
+                OpenedNode::Directory(child) => {
+                    if !ignored {
+                        entries.push(SelectedSource {
+                            path: path.clone(),
+                            relative: relative.clone(),
+                            is_dir: true,
+                        });
+                    }
+                    if !ignored || self.ignore.has_negations() {
+                        self.walk_open_dir(child, &relative, entries, after_open)?;
+                    }
+                }
+                OpenedNode::File(_) => {
+                    if !ignored {
+                        entries.push(SelectedSource {
+                            path,
+                            relative,
+                            is_dir: false,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Walks a directory source purely for validation so symlinks, special
@@ -192,7 +231,10 @@ impl BuildContext {
 
     /// Expands one selected directory source into the relative file/dir
     /// entries beneath it, honoring `.dockerignore`.
-    fn directory_contents(&self, source: &SelectedSource) -> Result<Vec<(PathBuf, PathBuf, bool)>> {
+    fn directory_contents(
+        &self,
+        source: &SelectedSource,
+    ) -> Result<Vec<(ContextPath, PathBuf, bool)>> {
         let entries = self.walk_filtered(&source.path)?;
         Ok(entries
             .into_iter()
@@ -208,27 +250,404 @@ impl BuildContext {
     }
 }
 
-fn validate_source_file_type(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        bail!(
-            "symbolic links are not supported in the build context: {}",
-            path.display()
-        );
+struct ContextRoot {
+    display: PathBuf,
+    directory: Dir,
+}
+
+impl ContextRoot {
+    fn open(path: &Path) -> Result<Self> {
+        let options = nofollow_open_options();
+        let file = CapabilityFile::open_ambient_with(path, &options, ambient_authority())
+            .with_context(|| format!("opening build context {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("reading build context {}", path.display()))?;
+        reject_symlink_or_reparse(&metadata).with_context(|| {
+            format!(
+                "build context cannot be a symbolic link or reparse point: {}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_dir() {
+            bail!(
+                "build context must be a directory: {} (pass the Dockerfile with -f and the \
+                 context directory as the positional argument)",
+                path.display()
+            );
+        }
+        Ok(Self {
+            display: path.to_path_buf(),
+            directory: Dir::from_std_file(file.into_std()),
+        })
     }
-    if !file_type.is_file() && !file_type.is_dir() {
-        bail!(
-            "special files are not supported in the build context: {}",
-            path.display()
-        );
+
+    fn open_node(&self, relative: &Path) -> std::io::Result<OpenedNode> {
+        validate_context_relative_path_io(relative)?;
+        if relative.as_os_str().is_empty() {
+            return self.directory.try_clone().map(OpenedNode::Directory);
+        }
+
+        let mut directory = self.directory.try_clone()?;
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                return Err(invalid_context_path(relative));
+            };
+            let opened = open_child_nofollow(&directory, name)?;
+            if components.peek().is_none() {
+                return Ok(opened);
+            }
+            match opened {
+                OpenedNode::Directory(child) => directory = child,
+                OpenedNode::File(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        format!(
+                            "context path ancestor is not a directory: {}",
+                            relative.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        unreachable!("non-empty relative paths have at least one component")
+    }
+
+    fn display_path(&self, relative: &Path) -> PathBuf {
+        if relative.as_os_str().is_empty() {
+            self.display.clone()
+        } else {
+            self.display.join(relative)
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ContextPath {
+    root: Arc<ContextRoot>,
+    relative: PathBuf,
+    display: PathBuf,
+}
+
+impl ContextPath {
+    fn new(root: Arc<ContextRoot>, relative: PathBuf) -> Result<Self> {
+        validate_context_relative_path(&relative)?;
+        let display = root.display_path(&relative);
+        Ok(Self {
+            root,
+            relative,
+            display,
+        })
+    }
+
+    pub(crate) fn display(&self) -> std::path::Display<'_> {
+        self.display.display()
+    }
+
+    fn open_node(&self) -> Result<OpenedNode> {
+        self.open_node_io().map_err(Into::into)
+    }
+
+    fn open_node_io(&self) -> std::io::Result<OpenedNode> {
+        self.root.open_node(&self.relative)
+    }
+
+    fn read_to_string(&self) -> std::io::Result<String> {
+        let OpenedNode::File(mut file) = self.open_node_io()? else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                format!("context path is a directory: {}", self.display()),
+            ));
+        };
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        Ok(text)
+    }
+
+    #[cfg(test)]
+    fn display_path(&self) -> &Path {
+        &self.display
+    }
+}
+
+impl fmt::Debug for ContextPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContextPath")
+            .field("relative", &self.relative)
+            .field("display", &self.display)
+            .finish_non_exhaustive()
+    }
+}
+
+enum OpenedNode {
+    File(CapabilityFile),
+    Directory(Dir),
+}
+
+impl OpenedNode {
+    fn is_dir(&self) -> bool {
+        matches!(self, Self::Directory(_))
+    }
+
+    fn metadata(&self) -> std::io::Result<CapabilityMetadata> {
+        match self {
+            Self::File(file) => file.metadata(),
+            Self::Directory(directory) => directory.dir_metadata(),
+        }
+    }
+}
+
+fn nofollow_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true)
+        .nonblock(true);
+    options
+}
+
+fn open_child_nofollow(directory: &Dir, name: &OsStr) -> std::io::Result<OpenedNode> {
+    validate_context_name_io(name)?;
+    open_child_nofollow_raw(directory, name)
+}
+
+fn open_child_nofollow_raw(directory: &Dir, name: &OsStr) -> std::io::Result<OpenedNode> {
+    let file = directory.open_with(Path::new(name), &nofollow_open_options())?;
+    let metadata = file.metadata()?;
+    reject_symlink_or_reparse(&metadata)?;
+    if metadata.is_dir() {
+        Ok(OpenedNode::Directory(Dir::from_std_file(file.into_std())))
+    } else if metadata.is_file() {
+        Ok(OpenedNode::File(file))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "special files are not supported in the build context",
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn directory_entry_names(directory: &Dir) -> std::io::Result<Vec<OsString>> {
+    directory
+        .entries()?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect()
+}
+
+#[cfg(windows)]
+fn directory_entry_names(directory: &Dir) -> std::io::Result<Vec<OsString>> {
+    const BUFFER_SIZE: usize = 64 * 1024;
+
+    let mut buffer = vec![0_u64; BUFFER_SIZE / std::mem::size_of::<u64>()];
+    let buffer_size = u32::try_from(BUFFER_SIZE).expect("64 KiB fits in u32");
+    let mut names = Vec::new();
+    let mut information_class = FileFullDirectoryRestartInfo;
+
+    loop {
+        buffer.fill(0);
+        let succeeded = unsafe {
+            GetFileInformationByHandleEx(
+                directory.as_raw_handle(),
+                information_class,
+                buffer.as_mut_ptr().cast(),
+                buffer_size,
+            )
+        };
+        if succeeded == 0 {
+            let err = std::io::Error::last_os_error();
+            let code = err.raw_os_error();
+            if code == Some(ERROR_NO_MORE_FILES as i32)
+                || (information_class == FileFullDirectoryRestartInfo
+                    && code == Some(ERROR_FILE_NOT_FOUND as i32))
+            {
+                break;
+            }
+            return Err(err);
+        }
+        parse_windows_directory_buffer(&buffer, &mut names)?;
+        information_class = FileFullDirectoryInfo;
+    }
+    Ok(names)
+}
+
+#[cfg(windows)]
+fn parse_windows_directory_buffer(
+    buffer: &[u64],
+    names: &mut Vec<OsString>,
+) -> std::io::Result<()> {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), std::mem::size_of_val(buffer))
+    };
+    let record_size = std::mem::size_of::<FILE_FULL_DIR_INFO>();
+    let name_offset = std::mem::offset_of!(FILE_FULL_DIR_INFO, FileName);
+    let mut offset = 0_usize;
+
+    loop {
+        let record_end = offset.checked_add(record_size).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "directory entry offset overflowed",
+            )
+        })?;
+        if record_end > bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "directory enumeration returned a truncated record",
+            ));
+        }
+        let record = unsafe {
+            std::ptr::read_unaligned(bytes.as_ptr().add(offset).cast::<FILE_FULL_DIR_INFO>())
+        };
+        let name_len = usize::try_from(record.FileNameLength).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "directory entry name length does not fit in memory",
+            )
+        })?;
+        if name_len % std::mem::size_of::<u16>() != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "directory enumeration returned an invalid UTF-16 byte length",
+            ));
+        }
+        let name_start = offset.checked_add(name_offset).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "directory entry name offset overflowed",
+            )
+        })?;
+        let name_end = name_start.checked_add(name_len).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "directory entry name length overflowed",
+            )
+        })?;
+        let name_bytes = bytes.get(name_start..name_end).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "directory enumeration returned a truncated name",
+            )
+        })?;
+        let wide_name: Vec<u16> = name_bytes
+            .chunks_exact(2)
+            .map(|bytes| u16::from_ne_bytes([bytes[0], bytes[1]]))
+            .collect();
+        let name = OsString::from_wide(&wide_name);
+        if name != OsStr::new(".") && name != OsStr::new("..") {
+            names.push(name);
+        }
+
+        if record.NextEntryOffset == 0 {
+            break;
+        }
+        let next = usize::try_from(record.NextEntryOffset).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "directory entry offset does not fit in memory",
+            )
+        })?;
+        if next < record_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "directory enumeration returned a non-progressing entry offset",
+            ));
+        }
+        offset = offset.checked_add(next).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "directory entry offset overflowed",
+            )
+        })?;
     }
     Ok(())
 }
 
+fn reject_symlink_or_reparse(metadata: &CapabilityMetadata) -> std::io::Result<()> {
+    if metadata.file_type().is_symlink() || metadata_is_reparse_point(metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "symbolic links and reparse points are not supported in the build context",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &CapabilityMetadata) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(_metadata: &CapabilityMetadata) -> bool {
+    false
+}
+
+fn validate_context_name(name: &OsStr) -> Result<()> {
+    validate_context_name_io(name).map_err(Into::into)
+}
+
+fn validate_context_name_io(name: &OsStr) -> std::io::Result<()> {
+    let Some(name) = name.to_str() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "context entries must have valid UTF-8 names",
+        ));
+    };
+    if name.is_empty() || name == "." || name == ".." || name.contains('\\') || name.contains(':') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid or non-portable context path component: {name:?}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_context_relative_path(path: &Path) -> Result<()> {
+    validate_context_relative_path_io(path).map_err(Into::into)
+}
+
+fn validate_context_relative_path_io(path: &Path) -> std::io::Result<()> {
+    if path
+        .as_os_str()
+        .to_str()
+        .is_some_and(|path| path.contains('\\'))
+    {
+        return Err(invalid_context_path(path));
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => validate_context_name_io(name)?,
+            _ => return Err(invalid_context_path(path)),
+        }
+    }
+    Ok(())
+}
+
+fn invalid_context_path(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "context paths must be relative and cannot contain prefixes, roots, parent \
+             components, or backslashes: {}",
+            path.display()
+        ),
+    )
+}
+
+fn looks_like_windows_prefix(component: &str) -> bool {
+    let bytes = component.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SelectedSource {
-    /// Absolute local path.
-    pub path: PathBuf,
+    /// Context-relative path backed by the fixed context directory handle.
+    pub path: ContextPath,
     /// Path relative to the context root ("." source keeps an empty path).
     pub relative: PathBuf,
     pub is_dir: bool,
@@ -236,7 +655,7 @@ pub(crate) struct SelectedSource {
 
 impl SelectedSource {
     fn base_name(&self) -> Result<&str> {
-        self.path
+        self.relative
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow!("source has no usable file name: {}", self.path.display()))
@@ -250,6 +669,12 @@ fn normalize_context_pattern(pattern: &str) -> Result<String> {
     let trimmed = pattern.trim();
     if trimmed.is_empty() {
         bail!("source pattern cannot be empty");
+    }
+    if trimmed.contains('\\') {
+        bail!("source {pattern:?} contains a backslash and is not a portable context path");
+    }
+    if trimmed.starts_with("//") {
+        bail!("source {pattern:?} uses a Windows/UNC path prefix");
     }
     let mut segments: Vec<&str> = Vec::new();
     for segment in trimmed.split('/') {
@@ -266,7 +691,13 @@ fn normalize_context_pattern(pattern: &str) -> Result<String> {
     if segments.is_empty() {
         return Ok(".".to_string());
     }
-    Ok(segments.join("/"))
+    if looks_like_windows_prefix(segments[0]) {
+        bail!("source {pattern:?} uses a Windows path prefix");
+    }
+    let normalized = segments.join("/");
+    validate_context_relative_path(Path::new(&normalized))
+        .with_context(|| format!("invalid source pattern {pattern:?}"))?;
+    Ok(normalized)
 }
 
 fn has_glob_meta(pattern: &str) -> bool {
@@ -655,9 +1086,9 @@ fn split_guest_path(path: &str) -> Result<(String, String)> {
 
 /// One tar entry: a local path mapped to its guest path relative to the
 /// extraction root.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct TarEntryPlan {
-    pub local: PathBuf,
+    pub local: ContextPath,
     pub guest_relative: PathBuf,
     pub is_dir: bool,
 }
@@ -712,20 +1143,12 @@ fn validate_tar_relative_path(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty() {
         bail!("tar entries cannot have an empty path");
     }
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => {
-                if part.to_str().is_none() {
-                    bail!(
-                        "tar entries must have valid UTF-8 names: {}",
-                        path.display()
-                    );
-                }
-            }
-            _ => bail!("tar entries must stay relative: {}", path.display()),
-        }
-    }
-    Ok(())
+    validate_context_relative_path(path).with_context(|| {
+        format!(
+            "tar entries must use portable relative paths: {}",
+            path.display()
+        )
+    })
 }
 
 /// Packages the planned entries into an uncompressed tar stream. Entries are
@@ -733,23 +1156,36 @@ fn validate_tar_relative_path(path: &Path) -> Result<()> {
 /// mtimes, matching Docker's `--chown`-less COPY behavior once extracted as
 /// root inside the guest.
 pub(crate) fn pack_transfer(entries: &[TarEntryPlan], out: std::fs::File) -> Result<u64> {
+    pack_transfer_impl(entries, out, |_| Ok(()))
+}
+
+fn pack_transfer_impl<F>(
+    entries: &[TarEntryPlan],
+    out: std::fs::File,
+    mut after_open: F,
+) -> Result<u64>
+where
+    F: FnMut(&TarEntryPlan) -> Result<()>,
+{
     let mut builder = tar::Builder::new(out);
     for entry in entries {
-        let metadata = std::fs::symlink_metadata(&entry.local)
-            .with_context(|| format!("reading {}", entry.local.display()))?;
-        let file_type = metadata.file_type();
-        if file_type.is_symlink() || (!file_type.is_dir() && !file_type.is_file()) {
-            bail!(
-                "context entry changed while packaging (symlink or special file): {}",
+        let opened = entry.local.open_node().with_context(|| {
+            format!(
+                "opening {} for packaging without following symbolic links or reparse points",
                 entry.local.display()
-            );
-        }
-        if file_type.is_dir() != entry.is_dir {
+            )
+        })?;
+        let metadata = opened
+            .metadata()
+            .with_context(|| format!("reading {}", entry.local.display()))?;
+        if opened.is_dir() != entry.is_dir {
             bail!(
                 "context entry changed while packaging: {}",
                 entry.local.display()
             );
         }
+        after_open(entry)?;
+
         let mut header = tar::Header::new_gnu();
         header.set_uid(0);
         header.set_gid(0);
@@ -758,28 +1194,29 @@ pub(crate) fn pack_transfer(entries: &[TarEntryPlan], out: std::fs::File) -> Res
             metadata
                 .modified()
                 .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|time| time.into_std().duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|duration| duration.as_secs())
                 .unwrap_or(0),
         );
-        if entry.is_dir {
-            header.set_entry_type(tar::EntryType::Directory);
-            header.set_size(0);
-            builder
-                .append_data(&mut header, &entry.guest_relative, std::io::empty())
-                .with_context(|| format!("packaging {}", entry.local.display()))?;
-        } else {
-            header.set_entry_type(tar::EntryType::Regular);
-            header.set_size(metadata.len());
-            let file = std::fs::File::open(&entry.local)
-                .with_context(|| format!("opening {}", entry.local.display()))?;
-            builder
-                .append_data(
-                    &mut header,
-                    &entry.guest_relative,
-                    SizedReader::new(file, metadata.len()),
-                )
-                .with_context(|| format!("packaging {}", entry.local.display()))?;
+        match opened {
+            OpenedNode::Directory(_) => {
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_size(0);
+                builder
+                    .append_data(&mut header, &entry.guest_relative, std::io::empty())
+                    .with_context(|| format!("packaging {}", entry.local.display()))?;
+            }
+            OpenedNode::File(file) => {
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_size(metadata.len());
+                builder
+                    .append_data(
+                        &mut header,
+                        &entry.guest_relative,
+                        SizedReader::new(file, metadata.len()),
+                    )
+                    .with_context(|| format!("packaging {}", entry.local.display()))?;
+            }
         }
     }
     let out = builder
@@ -827,22 +1264,28 @@ impl<R: Read> Read for SizedReader<R> {
 }
 
 #[cfg(unix)]
-fn unix_mode(metadata: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::MetadataExt;
+fn unix_mode(metadata: &CapabilityMetadata) -> u32 {
     metadata.mode() & 0o7777
 }
 
 #[cfg(not(unix))]
-fn unix_mode(_metadata: &std::fs::Metadata) -> u32 {
+fn unix_mode(_metadata: &CapabilityMetadata) -> u32 {
     0o644
 }
 
 /// Sniffs whether a local file is an archive Docker's ADD would
 /// auto-extract: gzip/bzip2/xz/zstd compressed streams or an uncompressed
 /// ustar tar.
-pub(crate) fn looks_like_add_archive(path: &Path) -> Result<bool> {
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+pub(crate) fn looks_like_add_archive(path: &ContextPath) -> Result<bool> {
+    let OpenedNode::File(mut file) = path.open_node().with_context(|| {
+        format!(
+            "opening {} without following symbolic links or reparse points",
+            path.display()
+        )
+    })?
+    else {
+        bail!("ADD source is no longer a regular file: {}", path.display());
+    };
     let mut header = [0_u8; 512];
     let mut filled = 0;
     while filled < header.len() {
@@ -887,6 +1330,31 @@ mod tests {
             .iter()
             .map(|source| source.relative.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn source_for_destination_test(name: &str, is_dir: bool) -> SelectedSource {
+        let root = Arc::new(ContextRoot::open(Path::new(".")).unwrap());
+        let relative = PathBuf::from(name);
+        SelectedSource {
+            path: ContextPath::new(root, relative.clone()).unwrap(),
+            relative,
+            is_dir,
+        }
+    }
+
+    fn packed_member(entries: &[TarEntryPlan], member: &str) -> Vec<u8> {
+        let archive_file = tempfile::NamedTempFile::new().unwrap();
+        pack_transfer(entries, archive_file.reopen().unwrap()).unwrap();
+        let mut archive = tar::Archive::new(archive_file.reopen().unwrap());
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap() == Path::new(member) {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                return bytes;
+            }
+        }
+        panic!("tar member {member:?} was not found");
     }
 
     #[test]
@@ -980,7 +1448,7 @@ mod tests {
         let sources = context.select_sources(&[".".into()]).unwrap();
         assert_eq!(sources.len(), 1);
         assert!(sources[0].is_dir);
-        assert_eq!(sources[0].path, context.root());
+        assert_eq!(sources[0].path.display_path(), context.root());
     }
 
     #[test]
@@ -1009,6 +1477,45 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("escapes the build context"), "{err}");
+    }
+
+    #[test]
+    fn source_paths_reject_windows_escape_forms_before_access() {
+        for pattern in [
+            r"..\secrets",
+            r"safe\..\secrets",
+            r"C:\secrets",
+            r"\\server\share",
+            "C:secrets",
+            "file:stream",
+            "//server/share",
+        ] {
+            let err = normalize_context_pattern(pattern).unwrap_err().to_string();
+            assert!(
+                err.contains("backslash") || err.contains("prefix") || err.contains("invalid"),
+                "{pattern:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_relative_paths_reject_roots_parents_prefixes_and_backslashes() {
+        for path in [
+            Path::new("/absolute"),
+            Path::new("../escape"),
+            Path::new("safe/../escape"),
+            Path::new("C:escape"),
+            Path::new("file:stream"),
+            Path::new(r"safe\escape"),
+            Path::new(r"\\server\share"),
+        ] {
+            assert!(
+                validate_context_relative_path(path).is_err(),
+                "{}",
+                path.display()
+            );
+        }
+        assert!(validate_context_relative_path(Path::new("safe/nested/file")).is_ok());
     }
 
     #[test]
@@ -1063,6 +1570,18 @@ mod tests {
     }
 
     #[test]
+    fn select_glob_handles_an_empty_context() {
+        let temp = TempDir::new().unwrap();
+        let context = context_with(&temp, None);
+
+        let err = context
+            .select_sources(&["*".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("matched no files"), "{err}");
+    }
+
+    #[test]
     fn select_glob_keeps_only_outermost_directory_matches() {
         let temp = TempDir::new().unwrap();
         touch(&temp, "pkg/sub/file.txt");
@@ -1105,15 +1624,70 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn select_exact_rejects_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let parent = TempDir::new().unwrap();
+        let context_dir = parent.path().join("context");
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(&context_dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), b"host secret").unwrap();
+        symlink(&outside, context_dir.join("link")).unwrap();
+        let context = BuildContext::load(&context_dir).unwrap();
+
+        let err = context
+            .select_sources(&["link/secret.txt".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symbolic links"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn context_root_handle_survives_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let parent = TempDir::new().unwrap();
+        let context_dir = parent.path().join("context");
+        let original_dir = parent.path().join("original-context");
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(&context_dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(context_dir.join("payload.txt"), b"original").unwrap();
+        fs::write(outside.join("payload.txt"), b"hostile!").unwrap();
+        let context = BuildContext::load(&context_dir).unwrap();
+
+        fs::rename(&context_dir, &original_dir).unwrap();
+        symlink(&outside, &context_dir).unwrap();
+
+        let sources = context.select_sources(&["payload.txt".into()]).unwrap();
+        let entries = transfer_entries(
+            &context,
+            &sources,
+            &DestPlan::Directory {
+                root: "/app".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(packed_member(&entries, "payload.txt"), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn select_rejects_special_files() {
-        use std::os::unix::net::UnixListener;
+        use std::process::Command;
 
         let temp = TempDir::new().unwrap();
-        UnixListener::bind(temp.path().join("socket")).unwrap();
+        let status = Command::new("mkfifo")
+            .arg(temp.path().join("fifo"))
+            .status()
+            .unwrap();
+        assert!(status.success());
         let context = context_with(&temp, None);
 
         let err = context
-            .select_sources(&["socket".into()])
+            .select_sources(&["fifo".into()])
             .unwrap_err()
             .to_string();
         assert!(err.contains("special files"), "{err}");
@@ -1152,19 +1726,11 @@ mod tests {
     }
 
     fn file_source(name: &str) -> SelectedSource {
-        SelectedSource {
-            path: PathBuf::from(format!("/ctx/{name}")),
-            relative: PathBuf::from(name),
-            is_dir: false,
-        }
+        source_for_destination_test(name, false)
     }
 
     fn dir_source(name: &str) -> SelectedSource {
-        SelectedSource {
-            path: PathBuf::from(format!("/ctx/{name}")),
-            relative: PathBuf::from(name),
-            is_dir: true,
-        }
+        source_for_destination_test(name, true)
     }
 
     #[test]
@@ -1335,6 +1901,71 @@ mod tests {
         assert_eq!(guest, ["keep.py"]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn transfer_rejects_selected_directory_replaced_by_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let parent = TempDir::new().unwrap();
+        let context_dir = parent.path().join("context");
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(context_dir.join("src")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(context_dir.join("src/original.txt"), b"original").unwrap();
+        fs::write(outside.join("host.txt"), b"host").unwrap();
+        let context = BuildContext::load(&context_dir).unwrap();
+        let sources = context.select_sources(&["src".into()]).unwrap();
+
+        fs::rename(context_dir.join("src"), context_dir.join("src-original")).unwrap();
+        symlink(&outside, context_dir.join("src")).unwrap();
+
+        let err = transfer_entries(
+            &context,
+            &sources,
+            &DestPlan::Directory {
+                root: "/app".into(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("symbolic links"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn traversal_uses_open_directory_handle_after_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let parent = TempDir::new().unwrap();
+        let context_dir = parent.path().join("context");
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(context_dir.join("src/nested")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(context_dir.join("src/nested/original.txt"), b"original").unwrap();
+        fs::write(outside.join("host.txt"), b"host").unwrap();
+        let context = BuildContext::load(&context_dir).unwrap();
+        let source = context.select_sources(&["src".into()]).unwrap().remove(0);
+        let mut swapped = false;
+
+        let walked = context
+            .walk_filtered_impl(&source.path, |path, is_dir| {
+                if !swapped && is_dir && path.relative == Path::new("src/nested") {
+                    fs::rename(
+                        context_dir.join("src/nested"),
+                        context_dir.join("src/nested-original"),
+                    )?;
+                    symlink(&outside, context_dir.join("src/nested"))?;
+                    swapped = true;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(swapped);
+        assert!(relatives(&walked).contains(&"src/nested/original.txt".to_string()));
+        assert!(!relatives(&walked).contains(&"src/nested/host.txt".to_string()));
+    }
+
     #[test]
     fn pack_transfer_writes_root_owned_entries() {
         let temp = TempDir::new().unwrap();
@@ -1367,21 +1998,101 @@ mod tests {
         assert_eq!(seen, ["file.txt"]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn pack_rejects_file_replaced_by_symlink_before_open() {
+        use std::os::unix::fs::symlink;
+
+        let parent = TempDir::new().unwrap();
+        let context_dir = parent.path().join("context");
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(&context_dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(context_dir.join("payload.txt"), b"original").unwrap();
+        fs::write(outside.join("payload.txt"), b"hostile!").unwrap();
+        let context = BuildContext::load(&context_dir).unwrap();
+        let sources = context.select_sources(&["payload.txt".into()]).unwrap();
+        let entries = transfer_entries(
+            &context,
+            &sources,
+            &DestPlan::Directory {
+                root: "/app".into(),
+            },
+        )
+        .unwrap();
+
+        fs::rename(
+            context_dir.join("payload.txt"),
+            context_dir.join("payload-original.txt"),
+        )
+        .unwrap();
+        symlink(outside.join("payload.txt"), context_dir.join("payload.txt")).unwrap();
+
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let err = pack_transfer(&entries, out.reopen().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symbolic links"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pack_reads_open_file_handle_after_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let parent = TempDir::new().unwrap();
+        let context_dir = parent.path().join("context");
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(&context_dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(context_dir.join("payload.txt"), b"original").unwrap();
+        fs::write(outside.join("payload.txt"), b"hostile!").unwrap();
+        let context = BuildContext::load(&context_dir).unwrap();
+        let sources = context.select_sources(&["payload.txt".into()]).unwrap();
+        let entries = transfer_entries(
+            &context,
+            &sources,
+            &DestPlan::Directory {
+                root: "/app".into(),
+            },
+        )
+        .unwrap();
+        let archive_file = tempfile::NamedTempFile::new().unwrap();
+        let mut swapped = false;
+
+        pack_transfer_impl(&entries, archive_file.reopen().unwrap(), |entry| {
+            if !swapped {
+                fs::rename(
+                    entry.local.display_path(),
+                    context_dir.join("payload-original.txt"),
+                )?;
+                symlink(outside.join("payload.txt"), entry.local.display_path())?;
+                swapped = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(swapped);
+        let mut archive = tar::Archive::new(archive_file.reopen().unwrap());
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"original");
+    }
+
     #[test]
     fn add_archive_sniffing_detects_tars_and_compression() {
         let temp = TempDir::new().unwrap();
 
         let plain = temp.path().join("plain.txt");
         fs::write(&plain, "not an archive").unwrap();
-        assert!(!looks_like_add_archive(&plain).unwrap());
 
         let gzip = temp.path().join("data.gz");
         fs::write(&gzip, [0x1f, 0x8b, 0x08, 0x00]).unwrap();
-        assert!(looks_like_add_archive(&gzip).unwrap());
 
         let zstd = temp.path().join("data.zst");
         fs::write(&zstd, [0x28, 0xb5, 0x2f, 0xfd, 0x00]).unwrap();
-        assert!(looks_like_add_archive(&zstd).unwrap());
 
         // Build a real ustar archive and confirm detection.
         let tar_path = temp.path().join("real.tar");
@@ -1396,6 +2107,19 @@ mod tests {
                 .unwrap();
             builder.finish().unwrap();
         }
-        assert!(looks_like_add_archive(&tar_path).unwrap());
+
+        let context = context_with(&temp, None);
+        let sources = context
+            .select_sources(&[
+                "plain.txt".into(),
+                "data.gz".into(),
+                "data.zst".into(),
+                "real.tar".into(),
+            ])
+            .unwrap();
+        assert!(!looks_like_add_archive(&sources[0].path).unwrap());
+        assert!(looks_like_add_archive(&sources[1].path).unwrap());
+        assert!(looks_like_add_archive(&sources[2].path).unwrap());
+        assert!(looks_like_add_archive(&sources[3].path).unwrap());
     }
 }

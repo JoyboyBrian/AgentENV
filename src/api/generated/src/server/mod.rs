@@ -2757,6 +2757,18 @@ fn sandboxes_sandbox_id_snapshots_post_validation(
 
     Ok((path_params, body))
 }
+fn capture_snapshot_request_body(
+    body: std::result::Result<
+        Json<models::SandboxSnapshotRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> std::result::Result<models::SandboxSnapshotRequest, (StatusCode, String)> {
+    match body {
+        Ok(Json(body)) => Ok(body),
+        Err(rejection) => Err((rejection.status(), rejection.to_string())),
+    }
+}
+
 /// SandboxesSandboxIdSnapshotsPost - POST /sandboxes/{sandboxID}/snapshots
 #[tracing::instrument(skip_all)]
 async fn sandboxes_sandbox_id_snapshots_post<I, A, E, C>(
@@ -2766,7 +2778,10 @@ async fn sandboxes_sandbox_id_snapshots_post<I, A, E, C>(
     headers: HeaderMap,
     Path(path_params): Path<models::SandboxesSandboxIdSnapshotsPostPathParams>,
     State(api_impl): State<I>,
-    Json(body): Json<models::SandboxSnapshotRequest>,
+    body: std::result::Result<
+        Json<models::SandboxSnapshotRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
@@ -2777,6 +2792,16 @@ where
         + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
+    let body = match capture_snapshot_request_body(body) {
+        Ok(body) => body,
+        Err((status, message)) => {
+            return Response::builder()
+                .status(status)
+                .body(Body::from(message))
+                .map_err(|_| status);
+        }
+    };
+
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
@@ -4856,4 +4881,40 @@ fn response_with_status_code_only(code: StatusCode) -> Result<Response, StatusCo
         .status(code)
         .body(Body::empty())
         .map_err(|_| code)
+}
+
+#[cfg(test)]
+mod capture_api_handler_tests {
+    use super::capture_snapshot_request_body;
+    use axum::body::Body;
+    use axum::extract::{FromRequest, Json};
+    use axum::http::{Request, StatusCode};
+
+    #[test]
+    fn unknown_capture_context_field_returns_bad_request() {
+        let runtime = tokio::runtime::Runtime::new().expect("create Tokio runtime");
+        runtime.block_on(async {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"finalContext":{"workingDirectory":"/app"}}"#,
+                ))
+                .expect("build request");
+            let extracted =
+                Json::<crate::models::SandboxSnapshotRequest>::from_request(request, &()).await;
+
+            let rejection = match extracted {
+                Ok(_) => panic!("unknown nested field must be rejected"),
+                Err(rejection) => rejection,
+            };
+            let response = match capture_snapshot_request_body(Err(rejection)) {
+                Err((status, _)) => status,
+                Ok(_) => panic!("JSON rejection must not reach the API implementation"),
+            };
+
+            assert_eq!(response, StatusCode::BAD_REQUEST);
+        });
+    }
 }

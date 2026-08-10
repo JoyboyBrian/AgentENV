@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -146,7 +147,7 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) {
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	websocket := isWebSocketRequest(r)
 	streaming := isStreamingRequest(r)
-	longLived := streaming || websocket
+	protocolLongLived := streaming || websocket
 	routingCtx, cancelRouting := context.WithTimeout(r.Context(), s.requestTimeout)
 	defer cancelRouting()
 
@@ -173,7 +174,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		} else if nodeID, ok := isNodeDetailRequest(r); ok {
 			setGatewayRouteSource(w, routeSourcePath)
-			s.handleNodeDetail(w, r, routingCtx, nodeID, longLived)
+			s.handleNodeDetail(w, r, routingCtx, nodeID, protocolLongLived)
 			return
 		}
 	}
@@ -194,6 +195,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if !hasSandbox {
 		routeSource = routeSourceSchedule
 	}
+	longLived := protocolLongLived || isSandboxEnvdFileUpload(r, routeSource, hostRoute)
 	setGatewayRouteSource(w, routeSource)
 	var node *schedulerv1.Node
 
@@ -727,15 +729,46 @@ func isStreamingRequest(r *http.Request) bool {
 	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Accept")), "text/event-stream") {
 		return true
 	}
-	// Multipart uploads (envd file transfers) run for as long as the transfer
-	// takes and must not inherit the ordinary proxied-request deadline.
-	if strings.HasPrefix(contentType, "multipart/form-data") {
-		return true
-	}
 	if headerContainsToken(r.Header, "Te", "trailers") {
 		return true
 	}
 	return false
+}
+
+func isSandboxEnvdFileUpload(r *http.Request, routeSource routeSource, hostRoute *hostRoute) bool {
+	if !isDataPlaneRouteSource(routeSource) || r.Method != http.MethodPost || r.URL.Path != "/files" {
+		return false
+	}
+
+	targetPort := ""
+	switch routeSource {
+	case routeSourceHeader:
+		if _, ok := sandboxIDFromHeaders(r.Header); !ok {
+			return false
+		}
+		var ok bool
+		targetPort, ok = targetPortFromHeaders(r.Header)
+		if !ok {
+			return false
+		}
+	case routeSourceHost:
+		if hostRoute == nil || strings.TrimSpace(hostRoute.sandboxID) == "" {
+			return false
+		}
+		targetPort = strconv.Itoa(hostRoute.targetPort)
+	default:
+		return false
+	}
+	// Keep this aligned with crates/aenv/src/grpc/mod.rs::ENVD_PORT_STR; the
+	// native files client always targets envd on this port.
+	if targetPort != "49983" {
+		return false
+	}
+
+	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil &&
+		strings.EqualFold(mediaType, "multipart/form-data") &&
+		strings.TrimSpace(params["boundary"]) != ""
 }
 
 func isWebSocketRequest(r *http.Request) bool {

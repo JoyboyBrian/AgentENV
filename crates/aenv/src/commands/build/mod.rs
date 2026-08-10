@@ -23,10 +23,13 @@ use clap::Args as ClapArgs;
 use context::{BuildContext, GuestPathKind, SelectedSource};
 use envd::filesystem::FileType;
 use envd::process::{process_event, StartResponse};
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use plan::{BuildPlan, BuildStep, CopyStep};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// TTL requested for the build sandbox; the keepalive refreshes it while the
@@ -39,6 +42,23 @@ const ENVD_READY_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 /// Extraction and guest-side interpretation run as root, so copied content
 /// is root-owned like Docker's `--chown`-less COPY.
 const GUEST_ROOT: &str = "root";
+/// Run each Dockerfile command as a monitored background job in a dedicated
+/// process group. When its shell exits, kill any descendants that it left
+/// behind so build-time daemons are not frozen into the final snapshot.
+///
+/// A process that deliberately creates a new session/process group can
+/// escape this boundary; supporting hostile daemonization would require a
+/// guest cgroup contract that envd does not currently expose.
+const RUN_PROCESS_GROUP_WRAPPER: &str = r#"
+set -m
+/bin/bash -lc "$1" &
+__aenv_run_pgid=$!
+set +m
+wait "$__aenv_run_pgid"
+__aenv_run_status=$?
+kill -KILL -- "-$__aenv_run_pgid" 2>/dev/null || true
+exit "$__aenv_run_status"
+"#;
 
 #[derive(ClapArgs)]
 #[command(after_help = "Examples:
@@ -86,11 +106,30 @@ fn run_with_client(client: Client, args: Args) -> Result<()> {
         .context("creating build sandbox")?;
     println!("Created build sandbox {sandbox_id}");
 
+    let capture_started = Arc::new(AtomicBool::new(false));
     let rt = super::tokio_rt()?;
     let build_result = rt.block_on(async {
+        let build = execute_build(
+            &client,
+            &sandbox_id,
+            &prepared,
+            &args.name,
+            capture_started.clone(),
+        );
+        tokio::pin!(build);
         tokio::select! {
-            result = execute_build(&client, &sandbox_id, &prepared, &args.name) => result,
-            _ = tokio::signal::ctrl_c() => Err(anyhow!("build interrupted")),
+            result = &mut build => result,
+            _ = tokio::signal::ctrl_c() => {
+                if capture_started.load(Ordering::Acquire) {
+                    eprintln!(
+                        "Snapshot capture is already in progress; waiting for it to finish \
+                         before cleaning up the build sandbox"
+                    );
+                    build.await
+                } else {
+                    Err(anyhow!("build interrupted"))
+                }
+            },
         }
     });
     // Dropping the runtime stops the keepalive task before the sandbox goes
@@ -207,6 +246,7 @@ async fn execute_build(
     sandbox_id: &str,
     prepared: &PreparedBuild,
     template_name: &str,
+    capture_started: Arc<AtomicBool>,
 ) -> Result<BuildOutcome> {
     let transport = client.transport(sandbox_id)?;
     let files = client.files(sandbox_id)?;
@@ -221,6 +261,7 @@ async fn execute_build(
         &files,
         prepared,
         template_name,
+        &capture_started,
     )
     .await;
     keepalive.abort();
@@ -234,8 +275,11 @@ async fn execute_steps(
     files: &EnvdFilesClient,
     prepared: &PreparedBuild,
     template_name: &str,
+    capture_started: &AtomicBool,
 ) -> Result<BuildOutcome> {
     let base = probe_base(transport, files).await?;
+    let mut state = EffectiveState::from_base(&base);
+
     let has_copy_steps = prepared
         .plan
         .steps
@@ -244,12 +288,6 @@ async fn execute_steps(
     if has_copy_steps {
         ensure_guest_tar(transport).await?;
     }
-
-    let mut state = EffectiveState {
-        env: Vec::new(),
-        workdir: base.workdir.clone(),
-        user: None,
-    };
 
     let total_steps = prepared.plan.steps.len() + 1;
     for (index, step) in prepared.plan.steps.iter().enumerate() {
@@ -270,6 +308,7 @@ async fn execute_steps(
             }
             BuildStep::User { user } => {
                 state.user = Some(user.clone());
+                state.execution_user = Some(user.clone());
             }
             BuildStep::Copy(copy) => {
                 let build_context = prepared
@@ -290,8 +329,26 @@ async fn execute_steps(
         }
     }
 
-    println!("Capturing snapshot...");
     let request = capture_request(template_name, &prepared.plan, &base, &state);
+    let mut startup = start_snapshot_startup(
+        transport,
+        request.start_cmd.as_deref(),
+        &request.final_context,
+        state.execution_user.as_deref(),
+    )
+    .await?;
+    if let Some(process) = startup.as_mut() {
+        if process.ensure_running_or_success().await? {
+            startup = None;
+        }
+    }
+
+    println!("Capturing snapshot...");
+    // Snapshot publication is a blocking, non-cancellable operation. Once it
+    // starts, Ctrl-C must wait for the result rather than report an
+    // interruption while the snapshot may still be committed in the
+    // background.
+    capture_started.store(true, Ordering::Release);
     let snapshot = {
         let client = client.clone();
         let sandbox_id = sandbox_id.to_string();
@@ -301,38 +358,38 @@ async fn execute_steps(
         .await
         .context("snapshot capture task failed")??
     };
+    // Keep the envd process stream alive until capture has completed. The
+    // captured VM memory then contains the already-started process; startup
+    // metadata alone is not responsible for launching it on resume.
+    drop(startup);
     Ok(BuildOutcome {
         snapshot_id: snapshot.snapshot_id,
     })
 }
 
-/// Builds the capture request: the final context is the probed base context
-/// overlaid with the Dockerfile's ENV/WORKDIR/USER results, and the startup
-/// command keeps the existing ENTRYPOINT/CMD derivation.
+/// Builds the capture request from the base context observable inside the
+/// guest, overlaid with the Dockerfile's final state.
 fn capture_request(
     template_name: &str,
     plan: &BuildPlan,
-    base: &BaseProbe,
+    _base: &BaseProbe,
     state: &EffectiveState,
 ) -> OwnedCaptureRequest {
-    let mut env_vars = base.env.clone();
-    for (key, value) in &state.env {
-        env_vars.insert(key.clone(), value.clone());
-    }
-    let user = state
-        .user
-        .clone()
-        .or_else(|| (!base.user.is_empty()).then(|| base.user.clone()));
+    let final_context = SnapshotFinalContext {
+        env_vars: state.env.clone(),
+        workdir: state.workdir.clone(),
+        user: state.user.clone(),
+        entrypoint: plan.entrypoint.clone(),
+        cmd: plan.cmd.clone(),
+        ..SnapshotFinalContext::default()
+    };
+    let start_cmd = effective_start_cmd(&final_context);
+
     OwnedCaptureRequest {
         name: template_name.to_string(),
-        final_context: SnapshotFinalContext {
-            env_vars,
-            workdir: state.workdir.clone(),
-            user,
-            entrypoint: plan.entrypoint.clone(),
-            cmd: plan.cmd.clone(),
-        },
-        start_cmd: plan.start_cmd.clone(),
+        final_context,
+        ready_cmd: start_cmd.as_ref().map(|_| String::new()),
+        start_cmd,
     }
 }
 
@@ -340,6 +397,7 @@ struct OwnedCaptureRequest {
     name: String,
     final_context: SnapshotFinalContext,
     start_cmd: Option<String>,
+    ready_cmd: Option<String>,
 }
 
 impl Client {
@@ -354,30 +412,40 @@ impl Client {
                 name: Some(&request.name),
                 final_context: Some(&request.final_context),
                 start_cmd: request.start_cmd.as_deref(),
+                ready_cmd: request.ready_cmd.as_deref(),
             },
         )
     }
 }
 
-/// Client-side effective build state: accumulated ENV pairs (in first-set
-/// order), the resolved working directory, and the active USER.
+/// Client-side effective build state used by subsequent instructions.
 struct EffectiveState {
-    env: Vec<(String, String)>,
+    env: HashMap<String, String>,
     workdir: String,
     user: Option<String>,
+    /// Per-request envd user after a Dockerfile USER instruction. Before
+    /// that instruction, omit Basic auth so envd uses the sandbox's boot
+    /// default exactly, including base-image user/group forms that cannot be
+    /// represented as a Basic-auth username.
+    execution_user: Option<String>,
 }
 
 impl EffectiveState {
-    fn set_env(&mut self, key: &str, value: &str) {
-        if let Some(existing) = self.env.iter_mut().find(|(name, _)| name == key) {
-            existing.1 = value.to_string();
-        } else {
-            self.env.push((key.to_string(), value.to_string()));
+    fn from_base(base: &BaseProbe) -> Self {
+        Self {
+            env: base.env.clone(),
+            workdir: base.workdir.clone(),
+            user: Some(base.user.clone()),
+            execution_user: None,
         }
     }
 
+    fn set_env(&mut self, key: &str, value: &str) {
+        self.env.insert(key.to_string(), value.to_string());
+    }
+
     fn env_map(&self) -> HashMap<String, String> {
-        self.env.iter().cloned().collect()
+        self.env.clone()
     }
 }
 
@@ -387,9 +455,7 @@ struct BaseProbe {
     user: String,
 }
 
-/// Reads the base image context from the running build VM: envd's default
-/// environment (`GET /envs`, the values injected from the image config) plus
-/// the effective default working directory and user.
+/// Reads the base context that is observable inside the running build VM.
 async fn probe_base(transport: &Transport, files: &EnvdFilesClient) -> Result<BaseProbe> {
     let env = files
         .default_envs()
@@ -416,9 +482,13 @@ async fn probe_base(transport: &Transport, files: &EnvdFilesClient) -> Result<Ba
         bail!("base image working directory probe returned {workdir:?}");
     }
 
-    let user_output = run_guest_command(transport, "id -un", GuestExec::default())
-        .await
-        .context("probing the base image default user")?;
+    let user_output = run_guest_command(
+        transport,
+        r#"printf '%s:%s\n' "$(id -u)" "$(id -g)""#,
+        GuestExec::default(),
+    )
+    .await
+    .context("probing the base image default user")?;
     if user_output.exit_code != 0 {
         bail!(
             "probing the base image default user exited with status {}{}",
@@ -427,8 +497,190 @@ async fn probe_base(transport: &Transport, files: &EnvdFilesClient) -> Result<Ba
         );
     }
     let user = user_output.stdout.trim().to_string();
+    let valid_user = user
+        .split_once(':')
+        .is_some_and(|(uid, gid)| uid.parse::<u32>().is_ok() && gid.parse::<u32>().is_ok());
+    if !valid_user {
+        bail!("base image default user probe returned {user:?}");
+    }
 
     Ok(BaseProbe { env, workdir, user })
+}
+
+fn effective_start_cmd(context: &SnapshotFinalContext) -> Option<String> {
+    let parts = match &context.entrypoint {
+        Some(entrypoint) => entrypoint,
+        None => context.cmd.as_ref()?,
+    };
+    if parts.len() == 3 && parts[0] == "/bin/sh" && parts[1] == "-c" {
+        return Some(parts[2].clone());
+    }
+    (!parts.is_empty()).then(|| {
+        parts
+            .iter()
+            .map(|part| shell_util::shell_quote(part))
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+}
+
+type ProcessStream = Pin<Box<dyn Stream<Item = Result<StartResponse>> + Send>>;
+
+struct StartedProcess {
+    pid: u32,
+    monitor: tokio::task::JoinHandle<Result<StartupExit>>,
+}
+
+impl StartedProcess {
+    /// Mirror the existing template-builder behavior: a startup command may
+    /// complete successfully, but an immediate failure must stop the build.
+    async fn ensure_running_or_success(&mut self) -> Result<bool> {
+        match tokio::time::timeout(Duration::from_millis(1), &mut self.monitor).await {
+            Err(_) => Ok(false),
+            Ok(joined) => {
+                let exit = joined.context("template command monitor task failed")??;
+                if exit.exit_code == 0 {
+                    return Ok(true);
+                }
+                bail!(
+                    "template command (pid {}) exited with status {} before snapshot capture{}",
+                    self.pid,
+                    exit.exit_code,
+                    exit.detail()
+                );
+            }
+        }
+    }
+}
+
+impl Drop for StartedProcess {
+    fn drop(&mut self) {
+        self.monitor.abort();
+    }
+}
+
+struct StartupExit {
+    exit_code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    error: Option<String>,
+}
+
+impl StartupExit {
+    fn detail(&self) -> String {
+        if let Some(error) = self.error.as_deref().filter(|error| !error.is_empty()) {
+            return format!(": {error}");
+        }
+        let stderr = String::from_utf8_lossy(&self.stderr);
+        let stderr = stderr.trim();
+        if !stderr.is_empty() {
+            return format!(": {stderr}");
+        }
+        let stdout = String::from_utf8_lossy(&self.stdout);
+        let stdout = stdout.trim();
+        if !stdout.is_empty() {
+            return format!(": {stdout}");
+        }
+        String::new()
+    }
+}
+
+/// Start the final template command before capture. Snapshot launch resumes
+/// the process from VM memory; merely storing startup metadata does not start
+/// it when a captured sandbox is resumed.
+async fn start_snapshot_startup(
+    transport: &Transport,
+    start_cmd: Option<&str>,
+    context: &SnapshotFinalContext,
+    execution_user: Option<&str>,
+) -> Result<Option<StartedProcess>> {
+    let Some(start_cmd) = start_cmd else {
+        return Ok(None);
+    };
+
+    println!("Starting template command...");
+    let request = build_start_request(StartOpts {
+        cmd: "/bin/bash",
+        args: vec!["-lc".to_string(), start_cmd.to_string()],
+        envs: context.env_vars.clone(),
+        pty: None,
+        stdin: false,
+        cwd: Some(context.workdir.clone()),
+    });
+    let mut stream = transport
+        .server_stream::<_, StartResponse>("Start", request, execution_user)
+        .await
+        .with_context(|| format!("starting template command {start_cmd:?}"))?;
+
+    while let Some(message) = stream.next().await {
+        let message = message.context("reading template command start event")?;
+        let Some(event) = message.event.and_then(|wrapper| wrapper.event) else {
+            continue;
+        };
+        match event {
+            process_event::Event::Start(start) => {
+                let monitor = tokio::spawn(drain_startup_stream(stream));
+                return Ok(Some(StartedProcess {
+                    pid: start.pid,
+                    monitor,
+                }));
+            }
+            process_event::Event::End(end) => {
+                bail!(
+                    "template command exited with status {} before it started{}",
+                    end.exit_code,
+                    end.error
+                        .as_deref()
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
+                );
+            }
+            process_event::Event::Data(_) | process_event::Event::Keepalive(_) => {}
+        }
+    }
+    bail!("template command stream ended before the process start event")
+}
+
+/// Continuously consume the startup stream through snapshot capture. This
+/// prevents a chatty process from filling HTTP/2 flow-control buffers and
+/// records terminal output if it exits before capture begins.
+async fn drain_startup_stream(mut stream: ProcessStream) -> Result<StartupExit> {
+    const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+
+    fn extend_bounded(target: &mut Vec<u8>, source: &[u8]) {
+        let remaining = MAX_DIAGNOSTIC_BYTES.saturating_sub(target.len());
+        target.extend_from_slice(&source[..source.len().min(remaining)]);
+    }
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    while let Some(message) = stream.next().await {
+        let message = message.context("reading template command output")?;
+        let Some(event) = message.event.and_then(|wrapper| wrapper.event) else {
+            continue;
+        };
+        match event {
+            process_event::Event::Data(data) => match data.output {
+                Some(process_event::data_event::Output::Stdout(bytes)) => {
+                    extend_bounded(&mut stdout, &bytes);
+                }
+                Some(process_event::data_event::Output::Stderr(bytes)) => {
+                    extend_bounded(&mut stderr, &bytes);
+                }
+                _ => {}
+            },
+            process_event::Event::End(end) => {
+                return Ok(StartupExit {
+                    exit_code: end.exit_code,
+                    stdout,
+                    stderr,
+                    error: end.error,
+                });
+            }
+            process_event::Event::Start(_) | process_event::Event::Keepalive(_) => {}
+        }
+    }
+    bail!("template command stream ended without an exit event")
 }
 
 async fn ensure_guest_tar(transport: &Transport) -> Result<()> {
@@ -447,19 +699,24 @@ async fn run_build_command(
     command: &str,
     state: &EffectiveState,
 ) -> Result<()> {
-    // Login shell, explicit env and cwd — matching the server-side template
-    // builder. The active USER is carried per-request as the envd execution
-    // user, exactly like the unary path.
+    // The inner login shell preserves the existing RUN semantics. The outer
+    // shell gives it a dedicated process group and removes ordinary
+    // background descendants before returning.
     let request = build_start_request(StartOpts {
         cmd: "/bin/bash",
-        args: vec!["-lc".to_string(), command.to_string()],
+        args: vec![
+            "-c".to_string(),
+            RUN_PROCESS_GROUP_WRAPPER.to_string(),
+            "aenv-build-run".to_string(),
+            command.to_string(),
+        ],
         envs: state.env_map(),
         pty: None,
         stdin: false,
         cwd: Some(state.workdir.clone()),
     });
     let stream = transport
-        .server_stream::<_, StartResponse>("Start", request, state.user.as_deref())
+        .server_stream::<_, StartResponse>("Start", request, state.execution_user.as_deref())
         .await
         .context("starting RUN command")?;
     let exit_code = drain_output(stream).await?;
@@ -728,8 +985,10 @@ fn spawn_keepalive(client: Client, sandbox_id: String) -> tokio::task::JoinHandl
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_workdir, EffectiveState};
+    use super::{capture_request, effective_start_cmd, resolve_workdir, BaseProbe, EffectiveState};
+    use crate::client::snapshots::SnapshotFinalContext;
     use clap::Parser;
+    use std::collections::HashMap;
 
     #[derive(Parser)]
     struct TestCli {
@@ -770,29 +1029,26 @@ mod tests {
     }
 
     #[test]
-    fn capture_request_merges_base_env_and_dockerfile_env() {
+    fn capture_request_merges_probed_base_env_with_dockerfile_context() {
         let plan = super::plan::parse_build_plan(
             "FROM ubuntu:24.04\nENV APP=1 PATH=/custom\nENTRYPOINT [\"/bin/app\"]\n",
             None,
         )
         .unwrap();
-        let base = super::BaseProbe {
-            env: std::collections::HashMap::from([
+        let base = BaseProbe {
+            env: HashMap::from([
                 ("PATH".to_string(), "/usr/bin".to_string()),
                 ("LANG".to_string(), "C.UTF-8".to_string()),
             ]),
             workdir: "/".to_string(),
-            user: "root".to_string(),
+            user: "1000:1000".to_string(),
         };
-        let mut state = EffectiveState {
-            env: Vec::new(),
-            workdir: "/app".to_string(),
-            user: None,
-        };
+        let mut state = EffectiveState::from_base(&base);
         state.set_env("APP", "1");
         state.set_env("PATH", "/custom");
+        state.workdir = "/app".to_string();
 
-        let request = super::capture_request("my-template", &plan, &base, &state);
+        let request = capture_request("my-template", &plan, &base, &state);
 
         assert_eq!(request.name, "my-template");
         // Base image env survives; Dockerfile ENV overrides on conflict.
@@ -801,35 +1057,70 @@ mod tests {
         assert_eq!(env.get("PATH").map(String::as_str), Some("/custom"));
         assert_eq!(env.get("APP").map(String::as_str), Some("1"));
         assert_eq!(request.final_context.workdir, "/app");
-        // No Dockerfile USER: the probed base user is captured explicitly.
-        assert_eq!(request.final_context.user.as_deref(), Some("root"));
+        assert_eq!(request.final_context.user.as_deref(), Some("1000:1000"));
+        assert_eq!(
+            state.execution_user, None,
+            "the base user/group must remain envd's boot default until USER overrides it"
+        );
         assert_eq!(
             request.final_context.entrypoint,
             Some(vec!["/bin/app".to_string()])
         );
+        assert_eq!(request.final_context.cmd, None);
         assert_eq!(request.start_cmd.as_deref(), Some("/bin/app"));
+        assert_eq!(request.ready_cmd.as_deref(), Some(""));
 
-        // A Dockerfile USER wins over the probed base user.
+        // A Dockerfile USER wins over the base user.
         state.user = Some("builder".to_string());
-        let request = super::capture_request("my-template", &plan, &base, &state);
+        let request = capture_request("my-template", &plan, &base, &state);
         assert_eq!(request.final_context.user.as_deref(), Some("builder"));
     }
 
     #[test]
-    fn effective_state_env_updates_preserve_first_set_order() {
-        let mut state = EffectiveState {
-            env: Vec::new(),
-            workdir: "/".into(),
-            user: None,
+    fn effective_start_cmd_keeps_entrypoint_over_cmd_precedence() {
+        let context = SnapshotFinalContext {
+            entrypoint: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+            cmd: Some(vec!["echo ignored".to_string()]),
+            ..SnapshotFinalContext::default()
         };
+        assert_eq!(effective_start_cmd(&context).as_deref(), Some("/bin/sh -c"));
+
+        let context = SnapshotFinalContext {
+            cmd: Some(vec!["python3".to_string(), "app.py".to_string()]),
+            ..SnapshotFinalContext::default()
+        };
+        assert_eq!(
+            effective_start_cmd(&context).as_deref(),
+            Some("python3 app.py")
+        );
+
+        let context = SnapshotFinalContext {
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf '%s\\n' 'shell form'".to_string(),
+            ]),
+            ..SnapshotFinalContext::default()
+        };
+        assert_eq!(
+            effective_start_cmd(&context).as_deref(),
+            Some("printf '%s\\n' 'shell form'")
+        );
+    }
+
+    #[test]
+    fn effective_state_env_updates_override_base_values() {
+        let mut state = EffectiveState::from_base(&BaseProbe {
+            env: HashMap::from([("A".to_string(), "base".to_string())]),
+            workdir: "/".to_string(),
+            user: "0:0".to_string(),
+        });
         state.set_env("A", "1");
         state.set_env("B", "2");
         state.set_env("A", "3");
 
-        assert_eq!(
-            state.env,
-            vec![("A".into(), "3".into()), ("B".into(), "2".into())]
-        );
+        assert_eq!(state.env.get("A").map(String::as_str), Some("3"));
+        assert_eq!(state.env.get("B").map(String::as_str), Some("2"));
         assert_eq!(state.env_map().get("A").map(String::as_str), Some("3"));
     }
 }

@@ -287,18 +287,26 @@ pub struct StartupCommand {
 
 impl StartupCommand {
     /// Normalizes a startup command: both commands empty means no startup at
-    /// all, and a start command without a ready command gets the default
-    /// ready wait.
-    pub fn normalized(mut self) -> Option<Self> {
+    /// all. An explicitly absent ready command remains empty.
+    pub fn normalized(self) -> Option<Self> {
         let start_cmd_empty = self.start_cmd.trim().is_empty();
         let ready_cmd_empty = self.ready_cmd.trim().is_empty();
         if start_cmd_empty && ready_cmd_empty {
             return None;
         }
-        if !start_cmd_empty && ready_cmd_empty {
-            self.ready_cmd = DEFAULT_READY_WITH_START_CMD.to_string();
-        }
         Some(self)
+    }
+
+    /// Normalizes a startup command and applies the template-build default
+    /// ready wait when a start command has no explicit ready command.
+    pub fn normalized_with_default_ready(self) -> Option<Self> {
+        let mut normalized = self.normalized()?;
+        let start_cmd_empty = normalized.start_cmd.trim().is_empty();
+        let ready_cmd_empty = normalized.ready_cmd.trim().is_empty();
+        if !start_cmd_empty && ready_cmd_empty {
+            normalized.ready_cmd = DEFAULT_READY_WITH_START_CMD.to_string();
+        }
+        Some(normalized)
     }
 }
 
@@ -596,7 +604,8 @@ impl fmt::Debug for RunnableSnapshot {
 mod tests {
     use super::{
         rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, ManagedLayer,
-        PersistedDiskImagePublication, SnapshotRecord, TemplateBuildErrorReason,
+        PersistedDiskImagePublication, SnapshotRecord, StartupCommand, TemplateBuildErrorReason,
+        DEFAULT_READY_WITH_START_CMD,
     };
     use std::collections::HashMap;
 
@@ -740,6 +749,32 @@ mod tests {
             .with_entrypoint(Some(vec![]))
             .with_cmd(Some(vec![]));
         assert_eq!(ctx.effective_start_cmd(), None);
+    }
+
+    #[test]
+    fn startup_normalization_preserves_empty_ready_command() {
+        let startup = StartupCommand {
+            start_cmd: "python3 app.py".to_string(),
+            ready_cmd: String::new(),
+            context: CommandContext::default(),
+        }
+        .normalized()
+        .expect("start command should remain enabled");
+
+        assert_eq!(startup.ready_cmd, "");
+    }
+
+    #[test]
+    fn template_startup_normalization_applies_default_ready_command() {
+        let startup = StartupCommand {
+            start_cmd: "python3 app.py".to_string(),
+            ready_cmd: String::new(),
+            context: CommandContext::default(),
+        }
+        .normalized_with_default_ready()
+        .expect("start command should remain enabled");
+
+        assert_eq!(startup.ready_cmd, DEFAULT_READY_WITH_START_CMD);
     }
 
     #[test]

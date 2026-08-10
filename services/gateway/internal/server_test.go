@@ -1160,11 +1160,11 @@ func TestIsStreamingRequest(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "multipart form data upload",
+			name: "multipart form data requires sandbox envd routing",
 			headers: http.Header{
 				"Content-Type": []string{"multipart/form-data; boundary=aenv-upload"},
 			},
-			want: true,
+			want: false,
 		},
 		{
 			name: "normal json request",
@@ -1184,6 +1184,235 @@ func TestIsStreamingRequest(t *testing.T) {
 			req.Header = tc.headers
 			if got := isStreamingRequest(req); got != tc.want {
 				t.Fatalf("isStreamingRequest() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsSandboxEnvdFileUpload(t *testing.T) {
+	const validMultipart = "multipart/form-data; boundary=aenv-build-context"
+
+	headerRoute := func(sandboxID, targetPort, contentType string) http.Header {
+		headers := make(http.Header)
+		if sandboxID != "" {
+			headers.Set(headerSandboxID, sandboxID)
+		}
+		if targetPort != "" {
+			headers.Set(headerTargetPort, targetPort)
+		}
+		if contentType != "" {
+			headers.Set("Content-Type", contentType)
+		}
+		return headers
+	}
+	e2bHeaderRoute := func(sandboxID, targetPort, contentType string) http.Header {
+		headers := make(http.Header)
+		if sandboxID != "" {
+			headers.Set(headerE2BSandboxID, sandboxID)
+		}
+		if targetPort != "" {
+			headers.Set(headerE2BTargetPort, targetPort)
+		}
+		if contentType != "" {
+			headers.Set("Content-Type", contentType)
+		}
+		return headers
+	}
+
+	tests := []struct {
+		name        string
+		method      string
+		path        string
+		routeSource routeSource
+		hostRoute   *hostRoute
+		headers     http.Header
+		want        bool
+	}{
+		{
+			name:        "native client header route",
+			method:      http.MethodPost,
+			path:        "/files?path=%2Ftmp%2Fctx.tar",
+			routeSource: routeSourceHeader,
+			headers:     headerRoute("sbx-upload", "49983", validMultipart),
+			want:        true,
+		},
+		{
+			name:        "e2b compatibility header route",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceHeader,
+			headers:     e2bHeaderRoute("sbx-upload", "49983", validMultipart),
+			want:        true,
+		},
+		{
+			name:        "host route",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceHost,
+			hostRoute:   &hostRoute{sandboxID: "sbx-upload", targetPort: 49983},
+			headers:     headerRoute("", "", validMultipart),
+			want:        true,
+		},
+		{
+			name:        "host route is authoritative over conflicting headers",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceHost,
+			hostRoute:   &hostRoute{sandboxID: "sbx-upload", targetPort: 49983},
+			headers:     headerRoute("spoofed", "49984", validMultipart),
+			want:        true,
+		},
+		{
+			name:        "header cannot override non envd host port",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceHost,
+			hostRoute:   &hostRoute{sandboxID: "sbx-upload", targetPort: 49984},
+			headers:     headerRoute("sbx-upload", "49983", validMultipart),
+			want:        false,
+		},
+		{
+			name:        "control plane path route",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourcePath,
+			headers:     headerRoute("sbx-upload", "49983", validMultipart),
+			want:        false,
+		},
+		{
+			name:        "scheduled route",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceSchedule,
+			headers:     headerRoute("sbx-upload", "49983", validMultipart),
+			want:        false,
+		},
+		{
+			name:        "gateway route",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceGateway,
+			headers:     headerRoute("sbx-upload", "49983", validMultipart),
+			want:        false,
+		},
+		{
+			name:        "missing sandbox header",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceHeader,
+			headers:     headerRoute("", "49983", validMultipart),
+			want:        false,
+		},
+		{
+			name:        "missing target port header",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceHeader,
+			headers:     headerRoute("sbx-upload", "", validMultipart),
+			want:        false,
+		},
+		{
+			name:        "wrong target port",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceHeader,
+			headers:     headerRoute("sbx-upload", "49984", validMultipart),
+			want:        false,
+		},
+		{
+			name:        "primary target port cannot be bypassed by e2b alias",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceHeader,
+			headers: func() http.Header {
+				headers := headerRoute("sbx-upload", "49984", validMultipart)
+				headers.Set(headerE2BTargetPort, "49983")
+				return headers
+			}(),
+			want: false,
+		},
+		{
+			name:        "missing host route",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceHost,
+			headers:     headerRoute("", "", validMultipart),
+			want:        false,
+		},
+		{
+			name:        "empty host sandbox",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceHost,
+			hostRoute:   &hostRoute{targetPort: 49983},
+			headers:     headerRoute("", "", validMultipart),
+			want:        false,
+		},
+		{
+			name:        "wrong method",
+			method:      http.MethodPut,
+			path:        "/files",
+			routeSource: routeSourceHeader,
+			headers:     headerRoute("sbx-upload", "49983", validMultipart),
+			want:        false,
+		},
+		{
+			name:        "wrong path",
+			method:      http.MethodPost,
+			path:        "/files/compose",
+			routeSource: routeSourceHeader,
+			headers:     headerRoute("sbx-upload", "49983", validMultipart),
+			want:        false,
+		},
+		{
+			name:        "missing multipart boundary",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceHeader,
+			headers:     headerRoute("sbx-upload", "49983", "multipart/form-data"),
+			want:        false,
+		},
+		{
+			name:        "blank multipart boundary",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceHeader,
+			headers:     headerRoute("sbx-upload", "49983", `multipart/form-data; boundary=" "`),
+			want:        false,
+		},
+		{
+			name:        "malformed multipart content type",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceHeader,
+			headers:     headerRoute("sbx-upload", "49983", "multipart/form-data; boundary="),
+			want:        false,
+		},
+		{
+			name:        "forged multipart prefix",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceHeader,
+			headers:     headerRoute("sbx-upload", "49983", "multipart/form-dataevil"),
+			want:        false,
+		},
+		{
+			name:        "non multipart content type",
+			method:      http.MethodPost,
+			path:        "/files",
+			routeSource: routeSourceHeader,
+			headers:     headerRoute("sbx-upload", "49983", "application/json"),
+			want:        false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Header = tc.headers.Clone()
+
+			if got := isSandboxEnvdFileUpload(req, tc.routeSource, tc.hostRoute); got != tc.want {
+				t.Fatalf("isSandboxEnvdFileUpload() = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -2224,13 +2453,10 @@ func slowChunkReader(chunks int, interval time.Duration, chunk string) io.Reader
 	return reader
 }
 
-// TestMultipartUploadOutlivesProxyRequestTimeout configures the ordinary proxy
-// request timeout shorter than the transfer duration and verifies that a
-// multipart envd file upload still completes through the streaming path. An
-// otherwise identical slow JSON request must keep hitting the ordinary
-// deadline, proving the multipart classification is what keeps the upload
-// alive.
-func TestMultipartUploadOutlivesProxyRequestTimeout(t *testing.T) {
+// TestSandboxEnvdMultipartUploadTimeoutScope verifies the classifier is wired
+// into proxy deadline selection: a native envd upload outlives the ordinary
+// timeout, while the same route with a non-multipart body does not.
+func TestSandboxEnvdMultipartUploadTimeoutScope(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		received, err := io.Copy(io.Discard, r.Body)
 		if err != nil {
@@ -2255,10 +2481,12 @@ func TestMultipartUploadOutlivesProxyRequestTimeout(t *testing.T) {
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
 
-	transferChunks := 8
-	transferInterval := 100 * time.Millisecond
+	const (
+		transferChunks   = 5
+		transferInterval = 75 * time.Millisecond
+	)
 
-	sendSlowUpload := func(contentType string) *http.Response {
+	sendSlowUpload := func(t *testing.T, contentType string) (int, string) {
 		t.Helper()
 		body := slowChunkReader(transferChunks, transferInterval, strings.Repeat("x", 64))
 		req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+"/files?path=%2Ftmp%2Fctx.tar", body)
@@ -2272,24 +2500,42 @@ func TestMultipartUploadOutlivesProxyRequestTimeout(t *testing.T) {
 		if err != nil {
 			t.Fatalf("upload request failed: %v", err)
 		}
-		return resp
+		defer resp.Body.Close()
+		responseBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read response body failed: %v", err)
+		}
+		return resp.StatusCode, string(responseBody)
 	}
 
-	multipartResp := sendSlowUpload("multipart/form-data; boundary=aenv-build-context")
-	defer multipartResp.Body.Close()
-	multipartBody, _ := io.ReadAll(multipartResp.Body)
-	if multipartResp.StatusCode != http.StatusOK {
-		t.Fatalf("multipart upload status = %d, want 200; body = %s", multipartResp.StatusCode, string(multipartBody))
-	}
-	wantBytes := fmt.Sprintf("%d", transferChunks*64)
-	if string(multipartBody) != wantBytes {
-		t.Fatalf("upstream received %s bytes, want %s", string(multipartBody), wantBytes)
+	tests := []struct {
+		name        string
+		contentType string
+		wantStatus  int
+		wantBody    string
+	}{
+		{
+			name:        "envd multipart upload outlives timeout",
+			contentType: "multipart/form-data; boundary=aenv-build-context",
+			wantStatus:  http.StatusOK,
+			wantBody:    fmt.Sprintf("%d", transferChunks*64),
+		},
+		{
+			name:        "non multipart upload keeps timeout",
+			contentType: "application/json",
+			wantStatus:  http.StatusGatewayTimeout,
+		},
 	}
 
-	jsonResp := sendSlowUpload("application/json")
-	defer jsonResp.Body.Close()
-	if jsonResp.StatusCode != http.StatusGatewayTimeout {
-		body, _ := io.ReadAll(jsonResp.Body)
-		t.Fatalf("slow non-streaming upload status = %d, want %d; body = %s", jsonResp.StatusCode, http.StatusGatewayTimeout, string(body))
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			status, body := sendSlowUpload(t, tc.contentType)
+			if status != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %s", status, tc.wantStatus, body)
+			}
+			if tc.wantBody != "" && body != tc.wantBody {
+				t.Fatalf("body = %q, want %q", body, tc.wantBody)
+			}
+		})
 	}
 }

@@ -439,7 +439,7 @@ fn prepare_startup(
     //         })
     // });
 
-    let mut startup = startup?.normalized()?;
+    let mut startup = startup?.normalized_with_default_ready()?;
     if override_startup {
         startup.context = build_context.clone();
     }

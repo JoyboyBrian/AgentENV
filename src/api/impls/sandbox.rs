@@ -1560,6 +1560,70 @@ mod tests {
         .with_labels(HashMap::from([("k".to_string(), "v".to_string())]))
     }
 
+    #[test]
+    fn capture_request_rejects_unknown_top_level_field() {
+        let error = serde_json::from_value::<models::SandboxSnapshotRequest>(serde_json::json!({
+            "startCmd": "echo ready",
+            "unexpected": true
+        }))
+        .expect_err("unknown top-level field must be rejected");
+
+        assert!(error.to_string().contains("unknown field `unexpected`"));
+    }
+
+    #[test]
+    fn capture_request_rejects_unknown_final_context_field() {
+        let error = serde_json::from_value::<models::SandboxSnapshotRequest>(serde_json::json!({
+            "finalContext": {
+                "workingDirectory": "/app"
+            }
+        }))
+        .expect_err("unknown nested context field must be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("unknown field `workingDirectory`"));
+    }
+
+    #[test]
+    fn capture_request_accepts_opaque_shell_and_oci_context_strings() {
+        let request = serde_json::from_value::<models::SandboxSnapshotRequest>(serde_json::json!({
+            "name": "safe-name",
+            "finalContext": {
+                "envVars": {
+                    "RUST_EXPR": "Vec::<u8>::new()"
+                },
+                "workdir": "/work/<tenant>/app",
+                "user": "1000:1000",
+                "entrypoint": ["/bin/sh", "-lc", "cargo run --bin app::<prod>"],
+                "cmd": ["printf '<ready>\\n'"],
+                "exposedPorts": ["8080/tcp"],
+                "volumes": ["/data/<tenant>"],
+                "labels": {
+                    "org.example.expression": "Vec::<u8>::new()"
+                }
+            },
+            "startCmd": "cargo run --bin app::<prod>",
+            "readyCmd": "test \"$(cat /tmp/status)\" = '<ready>'"
+        }))
+        .expect("deserialize capture request");
+
+        validator::Validate::validate(&request)
+            .expect("opaque command and context strings must not use HTML validation");
+    }
+
+    #[test]
+    fn capture_request_keeps_name_xss_validation() {
+        let request = serde_json::from_value::<models::SandboxSnapshotRequest>(serde_json::json!({
+            "name": "<script>alert(1)</script>",
+            "startCmd": "printf '<ready>\\n'"
+        }))
+        .expect("deserialize capture request");
+
+        validator::Validate::validate(&request)
+            .expect_err("snapshot name must retain existing XSS validation");
+    }
+
     fn captured_startup() -> StartupCommand {
         StartupCommand {
             start_cmd: "echo captured".to_string(),
@@ -1631,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_publish_start_cmd_replaces_startup_with_default_ready() {
+    fn capture_publish_start_cmd_stores_empty_ready_command() {
         let mut body = models::SandboxSnapshotRequest::new();
         body.start_cmd = Some("python3 app.py".to_string());
 
@@ -1640,10 +1704,7 @@ mod tests {
 
         let startup = startup.expect("start command should produce startup metadata");
         assert_eq!(startup.start_cmd, "python3 app.py");
-        assert_eq!(
-            startup.ready_cmd,
-            crate::snapshot::DEFAULT_READY_WITH_START_CMD
-        );
+        assert_eq!(startup.ready_cmd, "");
         assert_eq!(startup.context, context);
     }
 

@@ -13,6 +13,8 @@ vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
 [dependencies]
 anyhow = "1"
 bytes = "1"
+cap-fs-ext = "4.0.2"
+cap-std = "4.0.2"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
@@ -38,3 +40,6 @@ ureq = { version = "2", features = ["json", "tls"] }
 walkdir = "2"
 shell-util = { path = "../../crates/shell-util" }
 uuid = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

@@ -3321,7 +3321,9 @@ impl std::str::FromStr for Node {
             let val = match string_iter.next() {
                 Some(x) => x,
                 None => {
-                    return std::result::Result::Err("Missing value while parsing Node".to_string());
+                    return std::result::Result::Err(
+                        "Missing value while parsing Node".to_string(),
+                    );
                 }
             };
 
@@ -6252,48 +6254,41 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxRefre
 /// Full command context stored with a published snapshot, mirroring the OCI image config fields AgentENV tracks. Omitted fields are stored as empty, not merged from the captured sandbox context.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+#[serde(deny_unknown_fields)]
 pub struct SandboxSnapshotContext {
     #[serde(rename = "envVars")]
-    #[validate(custom(function = "check_xss_map_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_vars: Option<std::collections::HashMap<String, String>>,
 
     /// Working directory. Empty is normalized to \"/\".
     #[serde(rename = "workdir")]
-    #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
 
     /// Default user. Empty is treated as unset.
     #[serde(rename = "user")]
-    #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 
     /// OCI image config style entrypoint.
     #[serde(rename = "entrypoint")]
-    #[validate(custom(function = "check_xss_vec_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<Vec<String>>,
 
     /// OCI image config style command.
     #[serde(rename = "cmd")]
-    #[validate(custom(function = "check_xss_vec_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cmd: Option<Vec<String>>,
 
     #[serde(rename = "exposedPorts")]
-    #[validate(custom(function = "check_xss_vec_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exposed_ports: Option<Vec<String>>,
 
     #[serde(rename = "volumes")]
-    #[validate(custom(function = "check_xss_vec_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volumes: Option<Vec<String>>,
 
     #[serde(rename = "labels")]
-    #[validate(custom(function = "check_xss_map_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub labels: Option<std::collections::HashMap<String, String>>,
 }
@@ -6497,6 +6492,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxSnaps
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+#[serde(deny_unknown_fields)]
 pub struct SandboxSnapshotRequest {
     /// Optional name for the snapshot template. If a snapshot template with this name already exists, a new build will be assigned to the existing template instead of creating a new one.
     #[serde(rename = "name")]
@@ -6512,13 +6508,11 @@ pub struct SandboxSnapshotRequest {
 
     /// Optional start command stored with the published snapshot. When startCmd or readyCmd is provided, they replace the captured startup metadata; providing both as empty strings clears it. The startup command context is derived from the final context applied to the snapshot.
     #[serde(rename = "startCmd")]
-    #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_cmd: Option<String>,
 
-    /// Optional ready check command stored with the published snapshot. Defaults to the standard ready wait when only startCmd is provided.
+    /// Optional ready check command stored with the published snapshot. When omitted while startCmd is provided, an empty ready command is stored.
     #[serde(rename = "readyCmd")]
-    #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_cmd: Option<String>,
 }
@@ -9291,5 +9285,57 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<TemplateWith
                 r#"Unable to convert header: {hdr_value:?} to string: {e}"#
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod capture_api_model_tests {
+    use super::SandboxSnapshotRequest;
+    use validator::Validate;
+
+    #[test]
+    fn rejects_unknown_capture_request_fields_at_both_levels() {
+        let top_level = serde_json::from_value::<SandboxSnapshotRequest>(serde_json::json!({
+            "unexpected": true
+        }));
+        assert!(top_level.is_err());
+
+        let nested = serde_json::from_value::<SandboxSnapshotRequest>(serde_json::json!({
+            "finalContext": {
+                "workingDirectory": "/app"
+            }
+        }));
+        assert!(nested.is_err());
+    }
+
+    #[test]
+    fn accepts_opaque_command_context_strings_but_still_validates_name() {
+        let request = serde_json::from_value::<SandboxSnapshotRequest>(serde_json::json!({
+            "name": "safe-name",
+            "finalContext": {
+                "envVars": {
+                    "RUST_EXPR": "Vec::<u8>::new()"
+                },
+                "workdir": "/work/<tenant>/app",
+                "entrypoint": ["/bin/sh", "-lc", "cargo run --bin app::<prod>"],
+                "cmd": ["printf '<ready>\\n'"],
+                "volumes": ["/data/<tenant>"],
+                "labels": {
+                    "org.example.expression": "Vec::<u8>::new()"
+                }
+            },
+            "startCmd": "cargo run --bin app::<prod>",
+            "readyCmd": "test \"$(cat /tmp/status)\" = '<ready>'"
+        }))
+        .expect("deserialize capture request");
+        request
+            .validate()
+            .expect("opaque command/context strings must not use HTML validation");
+
+        let invalid_name = serde_json::from_value::<SandboxSnapshotRequest>(serde_json::json!({
+            "name": "<script>alert(1)</script>"
+        }))
+        .expect("deserialize capture request");
+        assert!(invalid_name.validate().is_err());
     }
 }

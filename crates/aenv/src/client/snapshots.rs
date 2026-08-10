@@ -6,11 +6,11 @@ use std::collections::HashMap;
 /// Final command context published with a snapshot. When supplied, the
 /// server replaces the sandbox's captured context wholesale, so omitted
 /// fields are stored as empty rather than merged.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SnapshotFinalContext {
-    #[serde(rename = "envVars", skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default, rename = "envVars", skip_serializing_if = "HashMap::is_empty")]
     pub env_vars: HashMap<String, String>,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub workdir: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
@@ -18,6 +18,16 @@ pub struct SnapshotFinalContext {
     pub entrypoint: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cmd: Option<Vec<String>>,
+    #[serde(
+        default,
+        rename = "exposedPorts",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub exposed_ports: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -28,6 +38,8 @@ pub struct CreateSnapshotRequest<'a> {
     pub final_context: Option<&'a SnapshotFinalContext>,
     #[serde(rename = "startCmd", skip_serializing_if = "Option::is_none")]
     pub start_cmd: Option<&'a str>,
+    #[serde(rename = "readyCmd", skip_serializing_if = "Option::is_none")]
+    pub ready_cmd: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -120,20 +132,28 @@ mod tests {
             user: Some("builder".to_string()),
             entrypoint: Some(vec!["/bin/app".to_string()]),
             cmd: None,
+            exposed_ports: vec!["8080/tcp".to_string()],
+            volumes: vec!["/data".to_string()],
+            labels: HashMap::from([("org.example.role".to_string(), "api".to_string())]),
         };
         let value = serde_json::to_value(CreateSnapshotRequest {
             name: Some("my-template"),
             final_context: Some(&context),
             start_cmd: Some("/bin/app serve"),
+            ready_cmd: Some("test -f /tmp/ready"),
         })
         .unwrap();
 
         assert_eq!(value["name"], "my-template");
         assert_eq!(value["startCmd"], "/bin/app serve");
+        assert_eq!(value["readyCmd"], "test -f /tmp/ready");
         assert_eq!(value["finalContext"]["workdir"], "/app");
         assert_eq!(value["finalContext"]["user"], "builder");
         assert_eq!(value["finalContext"]["envVars"]["PATH"], "/usr/bin");
         assert_eq!(value["finalContext"]["entrypoint"][0], "/bin/app");
+        assert_eq!(value["finalContext"]["exposedPorts"][0], "8080/tcp");
+        assert_eq!(value["finalContext"]["volumes"][0], "/data");
+        assert_eq!(value["finalContext"]["labels"]["org.example.role"], "api");
         assert!(value["finalContext"].get("cmd").is_none());
     }
 

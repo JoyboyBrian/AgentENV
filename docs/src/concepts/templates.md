@@ -74,12 +74,17 @@ Supported Dockerfile instructions:
 | `CMD` | Becomes `startCmd` if no `ENTRYPOINT` is present |
 | `EXPOSE` / `VOLUME` / `LABEL` / `STOPSIGNAL` | Warned and ignored |
 
+The build starts the effective `ENTRYPOINT`/`CMD` command in the build VM
+before snapshot capture and stores it with an empty ready command. A sandbox
+launched from the template therefore resumes the already-started process.
+
 `COPY`/`ADD` content is selected and packaged on the client, streamed through
 envd, and extracted inside the guest as root, so copied content is root-owned
 (Docker's `--chown`-less default). Destinations without a trailing `/` are
 resolved with a guest stat before transfer: an existing directory gets
-Docker's copy-into behavior, anything else is treated as a file target. The
-base image must provide `/bin/bash`, and `tar` when `COPY`/`ADD` is used.
+Docker's copy-into behavior; a missing target becomes a file for one file
+source or a directory for one directory source. Ambiguous forms are rejected.
+The base image must provide `/bin/bash`, and `tar` when `COPY`/`ADD` is used.
 
 Unsupported forms fail with actionable errors before the build VM is
 created: `ARG`, `SHELL`, `FROM scratch`, multi-stage builds, `COPY --from`,
@@ -89,10 +94,20 @@ Variable expansion (`$VAR`) is not performed outside `RUN`; such values are
 used literally with a warning. There is no build cache yet: a retry creates
 a fresh build sandbox and re-executes every instruction.
 
+Ordinary background jobs left by a `RUN` step are terminated before the next
+step so build-time daemons are not captured accidentally. Processes that
+deliberately detach into a new session or process group are outside this v1
+contract.
+
 ### Runtime Configuration
 
-Both methods read the same set of OCI image config fields. For `aenv pull`, these come from the image config or flags; for `aenv build`, they are set by the
-corresponding Dockerfile instructions executed during the build. The following fields from the [OCI image-spec config object](https://github.com/opencontainers/image-spec/blob/main/config.md) are recognised:
+`aenv pull` reads the OCI image config directly. Native `aenv build` preserves
+the base environment, working directory, and numeric user/group observed
+inside the build VM, then applies supported Dockerfile instructions. OCI-only
+metadata such as base-image ports, volumes, labels, entrypoint, and command is
+not inherited unless restated in the Dockerfile. The following fields from the
+[OCI image-spec config object](https://github.com/opencontainers/image-spec/blob/main/config.md)
+are recognised:
 
 | OCI field | Dockerfile instruction | Runtime effect |
 |-----------|------------------------|----------------|
@@ -100,9 +115,9 @@ corresponding Dockerfile instructions executed during the build. The following f
 | `WorkingDir` | `WORKDIR` | Default working directory |
 | `User` | `USER` | Default user |
 | `Entrypoint` / `Cmd` | `ENTRYPOINT` / `CMD` | Mapped to `startCmd` for `aenv build`; use `--start-cmd` explicitly for `aenv pull` |
-| `ExposedPorts` | `EXPOSE` | Stored as metadata only |
-| `Volumes` | `VOLUME` | Stored as metadata only |
-| `Labels` | `LABEL` | Stored as metadata only |
+| `ExposedPorts` | `EXPOSE` | Stored as metadata by `aenv pull`; ignored by native builds |
+| `Volumes` | `VOLUME` | Stored as metadata by `aenv pull`; ignored by native builds |
+| `Labels` | `LABEL` | Stored as metadata by `aenv pull`; ignored by native builds |
 
 ### Aliases
 
@@ -137,13 +152,17 @@ Displays all templates with their ID, name, build status, CPU, memory, disk size
 aenv template delete <template-id-or-name>   # alias: aenv template rm
 ```
 
-### Watch a build
+### Watch a server-side build
 
-`aenv build` always detaches immediately after submitting. Use `watch` to follow the build status until it succeeds or fails:
+`aenv pull -d` submits a server-side template build and returns immediately.
+Use `watch` to follow it until it succeeds or fails:
 
 ```bash
 aenv template watch <template-id-or-name>
 ```
+
+Native `aenv build` runs synchronously in the CLI and returns after snapshot
+capture and build-sandbox cleanup.
 
 ### Start a sandbox from a template
 

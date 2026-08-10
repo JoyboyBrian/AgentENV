@@ -649,6 +649,7 @@ components:
 
     SandboxSnapshotRequest:
       type: object
+      additionalProperties: false
       properties:
         name:
           type: string
@@ -673,11 +674,12 @@ components:
           type: string
           description: >-
             Optional ready check command stored with the published snapshot.
-            Defaults to the standard ready wait when only startCmd is
-            provided.
+            When omitted while startCmd is provided, an empty ready command is
+            stored.
 
     SandboxSnapshotContext:
       type: object
+      additionalProperties: false
       description: >-
         Full command context stored with a published snapshot, mirroring the
         OCI image config fields AgentENV tracks. Omitted fields are stored as

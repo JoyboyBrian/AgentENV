@@ -9,11 +9,11 @@ use parse_dockerfile::{Command, HereDoc, Instruction, RunInstruction, Source};
 use shell_util::shell_quote;
 
 /// A Dockerfile lowered to the instruction sequence the native build
-/// executes, plus the startup metadata captured with the final snapshot.
+/// executes, plus its final command-context overrides.
 #[derive(Debug)]
 pub(crate) struct BuildPlan {
-    /// Base image the build sandbox boots from (single non-scratch `FROM`,
-    /// unless overridden by `--image`).
+    /// Base image the build sandbox boots from. The Dockerfile must contain a
+    /// single non-scratch `FROM`; `--image` only replaces that image.
     pub base_image: String,
     pub steps: Vec<BuildStep>,
     /// `ENTRYPOINT` in OCI image config form (shell form becomes
@@ -21,9 +21,6 @@ pub(crate) struct BuildPlan {
     pub entrypoint: Option<Vec<String>>,
     /// `CMD` in OCI image config form.
     pub cmd: Option<Vec<String>>,
-    /// Startup command derived from ENTRYPOINT/CMD with the existing
-    /// precedence: ENTRYPOINT wins and replaces CMD entirely.
-    pub start_cmd: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -93,12 +90,35 @@ pub(crate) fn parse_build_plan(
     let mut cmd = None;
 
     for instruction in &parsed.instructions {
+        // Docker permits a global ARG before FROM. It is still unsupported in
+        // v1, but let the ARG arm below return the instruction-specific error
+        // instead of misclassifying it as an ordering problem.
+        if from_image.is_none()
+            && !matches!(instruction, Instruction::From(_) | Instruction::Arg(_))
+        {
+            bail!("Dockerfile instructions must follow the FROM instruction");
+        }
+
         match instruction {
             Instruction::From(from) => {
                 if from_image.is_some() {
                     bail!(
                         "multi-stage builds are not supported: only a single FROM instruction \
                          is allowed"
+                    );
+                }
+                if let Some(option) = from.options.first() {
+                    let name = option.name.value.as_ref();
+                    bail!(
+                        "FROM --{name} is not supported by aenv build v1; remove the option from \
+                         the FROM instruction"
+                    );
+                }
+                if let Some((_, alias)) = &from.as_ {
+                    let alias = alias.value.as_ref();
+                    bail!(
+                        "FROM stage alias {alias:?} is not supported by aenv build v1; remove \
+                         `AS {alias}` because only single-stage builds are supported"
                     );
                 }
                 let image = from.image.value.as_ref();
@@ -120,9 +140,6 @@ pub(crate) fn parse_build_plan(
                 from_image = Some(image.to_string());
             }
             Instruction::Run(run) => {
-                if from_image.is_none() {
-                    bail!("Dockerfile instructions must follow the FROM instruction");
-                }
                 steps.push(BuildStep::Run {
                     command: dockerfile_run_command(run, escape)?,
                 });
@@ -210,30 +227,15 @@ pub(crate) fn parse_build_plan(
         }
     }
 
-    let base_image = match image_override {
-        Some(image) => image,
-        None => from_image
-            .clone()
-            .context("Dockerfile must contain a FROM instruction (or pass --image)")?,
-    };
-    if from_image.is_none() && !steps.is_empty() {
-        bail!("Dockerfile instructions must follow the FROM instruction");
-    }
-
-    // ENTRYPOINT takes precedence and replaces CMD for the startup command;
-    // exec-form arrays are shell-quoted into one command (existing behavior).
-    let start_cmd = match (&entrypoint, &cmd) {
-        (Some(_), _) => start_cmd_from_config(&entrypoint),
-        (None, Some(_)) => start_cmd_from_config(&cmd),
-        (None, None) => None,
-    };
+    let from_image =
+        from_image.context("Dockerfile must contain exactly one actual FROM instruction")?;
+    let base_image = image_override.unwrap_or(from_image);
 
     Ok(BuildPlan {
         base_image,
         steps,
         entrypoint,
         cmd,
-        start_cmd,
     })
 }
 
@@ -521,25 +523,6 @@ fn dockerfile_command_vector(command: &Command<'_>) -> Option<Vec<String>> {
     }
 }
 
-fn start_cmd_from_config(config: &Option<Vec<String>>) -> Option<String> {
-    let parts = config.as_deref()?;
-    if parts.is_empty() {
-        return None;
-    }
-    // Shell form is stored as ["/bin/sh", "-c", cmd]; unwrap it back to the
-    // plain command the way the previous plan derivation did.
-    if parts.len() == 3 && parts[0] == "/bin/sh" && parts[1] == "-c" {
-        return Some(parts[2].clone());
-    }
-    Some(
-        parts
-            .iter()
-            .map(|part| shell_quote(part))
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
-}
-
 fn warn_ignored_instruction(instruction: &str) {
     eprintln!("warning: {instruction} instruction is not supported and will be ignored");
 }
@@ -615,6 +598,52 @@ ADD notes.txt /app/
     }
 
     #[test]
+    fn build_plan_rejects_instructions_before_from() {
+        let cases = [
+            ("ENV", "ENV A=1\nFROM ubuntu:24.04"),
+            ("WORKDIR", "WORKDIR /app\nFROM ubuntu:24.04"),
+            ("USER", "USER root\nFROM ubuntu:24.04"),
+            ("COPY", "COPY src /app\nFROM ubuntu:24.04"),
+            ("ADD", "ADD src /app\nFROM ubuntu:24.04"),
+            (
+                "ENTRYPOINT",
+                "ENTRYPOINT [\"/bin/true\"]\nFROM ubuntu:24.04",
+            ),
+            ("CMD", "CMD [\"/bin/true\"]\nFROM ubuntu:24.04"),
+            ("EXPOSE", "EXPOSE 8080\nFROM ubuntu:24.04"),
+            ("VOLUME", "VOLUME /data\nFROM ubuntu:24.04"),
+            ("LABEL", "LABEL maintainer=test\nFROM ubuntu:24.04"),
+            ("MAINTAINER", "MAINTAINER AgentENV\nFROM ubuntu:24.04"),
+            ("STOPSIGNAL", "STOPSIGNAL SIGTERM\nFROM ubuntu:24.04"),
+        ];
+
+        for (instruction, dockerfile) in cases {
+            let err = plan_err(dockerfile);
+            assert!(
+                err.contains("FROM"),
+                "{instruction} before FROM should be rejected: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_plan_rejects_global_arg_with_the_arg_specific_error() {
+        let err = plan_err("ARG BASE=ubuntu:24.04\nFROM $BASE");
+        assert!(err.contains("ARG"), "{err}");
+        assert!(err.contains("not supported"), "{err}");
+    }
+
+    #[test]
+    fn build_plan_image_override_does_not_replace_missing_from() {
+        let err = format!(
+            "{:#}",
+            parse_build_plan("# syntax=docker/dockerfile:1\n", Some("alpine:3".into()))
+                .unwrap_err()
+        );
+        assert!(err.contains("FROM"), "{err}");
+    }
+
+    #[test]
     fn build_plan_image_override_replaces_from() {
         let plan =
             parse_build_plan("FROM ubuntu:24.04\nRUN true", Some("alpine:3".into())).unwrap();
@@ -635,8 +664,28 @@ ADD notes.txt /app/
 
     #[test]
     fn build_plan_rejects_second_from() {
-        let err = plan_err("FROM ubuntu:24.04 AS base\nFROM node:20");
+        let err = plan_err("FROM ubuntu:24.04\nFROM node:20");
         assert!(err.contains("multi-stage"), "{err}");
+    }
+
+    #[test]
+    fn build_plan_rejects_from_options_and_aliases() {
+        let cases = [
+            (
+                "platform option",
+                "FROM --platform=linux/amd64 ubuntu:24.04",
+                "--platform",
+            ),
+            ("stage alias", "FROM ubuntu:24.04 AS base", "stage alias"),
+        ];
+
+        for (case, dockerfile, expected) in cases {
+            let err = plan_err(dockerfile);
+            assert!(
+                err.contains(expected),
+                "{case} should be rejected actionably: {err}"
+            );
+        }
     }
 
     #[test]
@@ -786,7 +835,7 @@ RUN apt-get update && \
     }
 
     #[test]
-    fn build_plan_uses_entrypoint_as_start_cmd() {
+    fn build_plan_preserves_entrypoint_and_cmd_vectors() {
         let plan = plan(
             r#"
 FROM ubuntu:24.04
@@ -795,7 +844,6 @@ ENTRYPOINT ["/usr/bin/env", "bash"]
 "#,
         );
 
-        assert_eq!(plan.start_cmd, Some("/usr/bin/env bash".to_string()));
         assert_eq!(
             plan.entrypoint,
             Some(vec!["/usr/bin/env".to_string(), "bash".to_string()])
@@ -804,7 +852,7 @@ ENTRYPOINT ["/usr/bin/env", "bash"]
     }
 
     #[test]
-    fn build_plan_exec_form_args_with_spaces_are_quoted() {
+    fn build_plan_preserves_exec_form_args_with_spaces() {
         let plan = plan(
             r#"
 FROM ubuntu:24.04
@@ -812,13 +860,19 @@ ENTRYPOINT ["sh", "-c", "echo hello world"]
 "#,
         );
 
-        assert_eq!(plan.start_cmd, Some("sh -c 'echo hello world'".to_string()));
+        assert_eq!(
+            plan.entrypoint,
+            Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo hello world".to_string()
+            ])
+        );
     }
 
     #[test]
     fn build_plan_exec_form_cmd_used_when_no_entrypoint() {
         let plan = plan("FROM ubuntu:24.04\nCMD [\"python3\", \"app.py\"]\n");
-        assert_eq!(plan.start_cmd, Some("python3 app.py".to_string()));
         assert_eq!(
             plan.cmd,
             Some(vec!["python3".to_string(), "app.py".to_string()])
@@ -828,7 +882,6 @@ ENTRYPOINT ["sh", "-c", "echo hello world"]
     #[test]
     fn build_plan_shell_form_cmd_maps_to_sh_c_vector() {
         let plan = plan("FROM ubuntu:24.04\nCMD sleep infinity\n");
-        assert_eq!(plan.start_cmd, Some("sleep infinity".to_string()));
         assert_eq!(
             plan.cmd,
             Some(vec![

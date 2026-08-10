@@ -39,6 +39,7 @@ vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
 [dev-dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+validator = "0.20"
 
 [dependencies]
 firecracker_client = { version = "1.15.1", path = "thirdparty/firecracker-client" }
