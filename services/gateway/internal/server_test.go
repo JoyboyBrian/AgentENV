@@ -1160,6 +1160,13 @@ func TestIsStreamingRequest(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "multipart form data upload",
+			headers: http.Header{
+				"Content-Type": []string{"multipart/form-data; boundary=aenv-upload"},
+			},
+			want: true,
+		},
+		{
 			name: "normal json request",
 			headers: http.Header{
 				"Content-Type": []string{"application/json"},
@@ -2196,5 +2203,93 @@ func TestGatewayClassifiesClientCanceledProxyErrors(t *testing.T) {
 	getReq := httptest.NewRequest(http.MethodGet, "/process.Process/StreamInput", nil)
 	if isStreamInputProxyRequest(getReq) {
 		t.Fatalf("GET StreamInput should not be classified as stream input")
+	}
+}
+
+// slowChunkReader emits fixed-size chunks with a delay between them so a
+// transfer deterministically outlasts a short proxy request timeout without
+// requiring a naturally slow multi-second test.
+func slowChunkReader(chunks int, interval time.Duration, chunk string) io.Reader {
+	reader, writer := io.Pipe()
+	go func() {
+		for i := 0; i < chunks; i++ {
+			time.Sleep(interval)
+			if _, err := io.WriteString(writer, chunk); err != nil {
+				writer.CloseWithError(err)
+				return
+			}
+		}
+		writer.Close()
+	}()
+	return reader
+}
+
+// TestMultipartUploadOutlivesProxyRequestTimeout configures the ordinary proxy
+// request timeout shorter than the transfer duration and verifies that a
+// multipart envd file upload still completes through the streaming path. An
+// otherwise identical slow JSON request must keep hitting the ordinary
+// deadline, proving the multipart classification is what keeps the upload
+// alive.
+func TestMultipartUploadOutlivesProxyRequestTimeout(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received, err := io.Copy(io.Discard, r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		fmt.Fprintf(w, "%d", received)
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(t, stubSchedulerClient{
+		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			if req.GetSandboxId() != "sbx-upload" {
+				return nil, fmt.Errorf("unexpected sandbox id lookup: %q", req.GetSandboxId())
+			}
+			return &schedulerv1.LookupNodeResponse{
+				Node: &schedulerv1.Node{NodeId: "node-1", Endpoint: upstream.URL},
+			}, nil
+		},
+	}, 200*time.Millisecond, 1024)
+
+	gatewayServer := httptest.NewServer(server.Handler())
+	defer gatewayServer.Close()
+
+	transferChunks := 8
+	transferInterval := 100 * time.Millisecond
+
+	sendSlowUpload := func(contentType string) *http.Response {
+		t.Helper()
+		body := slowChunkReader(transferChunks, transferInterval, strings.Repeat("x", 64))
+		req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+"/files?path=%2Ftmp%2Fctx.tar", body)
+		if err != nil {
+			t.Fatalf("build upload request failed: %v", err)
+		}
+		req.Header.Set(headerSandboxID, "sbx-upload")
+		req.Header.Set(headerTargetPort, "49983")
+		req.Header.Set("Content-Type", contentType)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("upload request failed: %v", err)
+		}
+		return resp
+	}
+
+	multipartResp := sendSlowUpload("multipart/form-data; boundary=aenv-build-context")
+	defer multipartResp.Body.Close()
+	multipartBody, _ := io.ReadAll(multipartResp.Body)
+	if multipartResp.StatusCode != http.StatusOK {
+		t.Fatalf("multipart upload status = %d, want 200; body = %s", multipartResp.StatusCode, string(multipartBody))
+	}
+	wantBytes := fmt.Sprintf("%d", transferChunks*64)
+	if string(multipartBody) != wantBytes {
+		t.Fatalf("upstream received %s bytes, want %s", string(multipartBody), wantBytes)
+	}
+
+	jsonResp := sendSlowUpload("application/json")
+	defer jsonResp.Body.Close()
+	if jsonResp.StatusCode != http.StatusGatewayTimeout {
+		body, _ := io.ReadAll(jsonResp.Body)
+		t.Fatalf("slow non-streaming upload status = %d, want %d; body = %s", jsonResp.StatusCode, http.StatusGatewayTimeout, string(body))
 	}
 }

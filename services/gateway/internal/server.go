@@ -727,6 +727,11 @@ func isStreamingRequest(r *http.Request) bool {
 	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Accept")), "text/event-stream") {
 		return true
 	}
+	// Multipart uploads (envd file transfers) run for as long as the transfer
+	// takes and must not inherit the ordinary proxied-request deadline.
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		return true
+	}
 	if headerContainsToken(r.Header, "Te", "trailers") {
 		return true
 	}
