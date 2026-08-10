@@ -52,19 +52,30 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 | `-d, --detach` | Submit the build and return immediately without waiting |
 | `--timeout <SECS>` | Maximum seconds to wait for the build to complete |
 
-### `aenv build <dockerfile> --name <name>`
+### `aenv build [context] --name <name>`
 
-Create a template from a local Dockerfile.
+Create a template from a single-stage Dockerfile and a local build context.
+The CLI orchestrates the build in a temporary sandbox and streams
+`COPY`/`ADD` content directly into it; the build context is never persisted
+on AgentENV hosts.
 
 ```bash
-aenv build ./Dockerfile --name my-app
-aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
+aenv build . --name my-app
+aenv build ./service --name my-app -f ./service/Dockerfile.prod
+aenv build . --name my-app --image ghcr.io/myorg/base:latest
 ```
 
 | Flag | Description |
 |------|-------------|
+| `[context]` | Build context directory (default `.`) |
+| `-f, --file <path>` | Dockerfile path (default `<context>/Dockerfile`) |
 | `--name <name>` | Required template name |
 | `--image <image>` | Override the `FROM` image used as the rootfs base |
+| `--cpu <count>` / `--memory <MiB>` | Build sandbox resources (become the template resources) |
+| `--disk-size-mb <MiB>` | Build sandbox root filesystem size |
+
+See [Templates](../concepts/templates.md#aenv-build) for the supported
+Dockerfile instruction set.
 
 ### `aenv template list`
 

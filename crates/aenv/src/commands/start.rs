@@ -34,7 +34,7 @@ pub struct Args {
     detach: bool,
 }
 
-fn parse_disk_size_mb(value: &str) -> std::result::Result<u32, String> {
+pub(crate) fn parse_disk_size_mb(value: &str) -> std::result::Result<u32, String> {
     let size = value
         .parse::<u32>()
         .map_err(|_| "disk size must be a positive integer in MiB".to_string())?;

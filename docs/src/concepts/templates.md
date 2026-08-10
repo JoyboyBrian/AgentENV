@@ -39,30 +39,55 @@ aenv pull ubuntu:24.04
 
 > ⚠️ **Experimental** — Not recommended for production use.
 
-Build a template by running Dockerfile instructions inside a temporary sandbox:
+Build a template from a single-stage Dockerfile and a local build context.
+The build is orchestrated entirely by the CLI: `aenv` boots an ordinary cold
+sandbox from the `FROM` image, executes the instructions in it through envd,
+streams `COPY`/`ADD` content directly into the VM (build-context bytes are
+never persisted on AgentENV hosts), and captures the result as a named
+template:
 
 ```bash
-aenv build ./Dockerfile --name my-template
+aenv build . --name my-template
+aenv build ./service --name my-service -f ./service/Dockerfile.prod
 ```
 
 | Flag | Description |
 |------|-------------|
+| `[context]` | Build context directory (default `.`) |
+| `-f, --file <path>` | Dockerfile path (default `<context>/Dockerfile`) |
 | `--name <name>` | Required template name |
 | `--image <ref>` | Override the `FROM` image |
+| `--cpu`, `--memory`, `--disk-size-mb` | Build sandbox resources (become the template resources) |
 
 Supported Dockerfile instructions:
 
 | Instruction | Behavior |
 |-------------|----------|
-| `FROM` | Base image (overridable with `--image`) |
-| `RUN` | Shell command executed inside the build sandbox |
-| `ENV` | Set an environment variable |
-| `ARG` | Set a build-time variable |
+| `FROM` | Single non-`scratch` base image (overridable with `--image`) |
+| `RUN` | Shell-form, exec-form, and heredoc commands executed via `/bin/bash -lc` |
+| `ENV` | Set environment variables (multi-key `KEY=value` form supported) |
 | `WORKDIR` | Create the directory if needed and set it as the working directory |
-| `USER` | Set the default user (a missing named account is created at the end of the build) |
+| `USER` | Set the execution user for subsequent `RUN` instructions and the template default user |
+| `COPY` | Copy files/directories from the local build context (`.dockerignore` honored) |
+| `ADD` | Local files/directories only, with `COPY` behavior (no URLs, no auto-extraction) |
 | `ENTRYPOINT` | Becomes the template `startCmd` |
 | `CMD` | Becomes `startCmd` if no `ENTRYPOINT` is present |
-| `EXPOSE` / `VOLUME` / `LABEL` | Accepted but stored as metadata only |
+| `EXPOSE` / `VOLUME` / `LABEL` / `STOPSIGNAL` | Warned and ignored |
+
+`COPY`/`ADD` content is selected and packaged on the client, streamed through
+envd, and extracted inside the guest as root, so copied content is root-owned
+(Docker's `--chown`-less default). Destinations without a trailing `/` are
+resolved with a guest stat before transfer: an existing directory gets
+Docker's copy-into behavior, anything else is treated as a file target. The
+base image must provide `/bin/bash`, and `tar` when `COPY`/`ADD` is used.
+
+Unsupported forms fail with actionable errors before the build VM is
+created: `ARG`, `SHELL`, `FROM scratch`, multi-stage builds, `COPY --from`,
+`COPY --chown`/`--chmod`, remote-URL `ADD`, archive auto-extraction,
+symlinks and special files in the context, and `HEALTHCHECK`/`ONBUILD`.
+Variable expansion (`$VAR`) is not performed outside `RUN`; such values are
+used literally with a warning. There is no build cache yet: a retry creates
+a fresh build sandbox and re-executes every instruction.
 
 ### Runtime Configuration
 
@@ -86,7 +111,7 @@ a human-readable alias:
 
 ```bash
 aenv pull ubuntu:24.04 --name my-base
-aenv build ./Dockerfile --name my-service
+aenv build . --name my-service
 ```
 
 The alias can be used wherever a template ID is accepted:

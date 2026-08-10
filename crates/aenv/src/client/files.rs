@@ -163,6 +163,28 @@ impl EnvdFilesClient {
         ensure_http_success(response).await
     }
 
+    /// Reads envd's default environment variables (`GET /envs`) — the values
+    /// injected at sandbox init from the rootfs image config.
+    pub async fn default_envs(&self) -> Result<std::collections::HashMap<String, String>> {
+        let response = timeout(
+            TRANSFER_IDLE_TIMEOUT,
+            self.http.get(format!("{}/envs", self.base_url)).send(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "reading sandbox environment: no response for {} seconds",
+                TRANSFER_IDLE_TIMEOUT.as_secs()
+            )
+        })?
+        .context("reading sandbox environment")?;
+        let response = ensure_http_success(response).await?;
+        response
+            .json()
+            .await
+            .context("decoding sandbox environment")
+    }
+
     pub async fn stat(&self, path: &str, username: Option<&str>) -> Result<Option<EntryInfo>> {
         let response = self
             .transport

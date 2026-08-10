@@ -58,6 +58,7 @@ dependencies = [
  "serde_json",
  "shell-util",
  "tabled",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-util",
