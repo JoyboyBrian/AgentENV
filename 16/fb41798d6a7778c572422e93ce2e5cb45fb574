@@ -1,0 +1,55 @@
+docs/src/getting-started/aenv-cli.md
+  s_fdf58e6ff3480a::t_75e75370012523 55,57-60,63-65,70-71,74-78
+crates/aenv/src/commands/build/e2e.rs
+  s_fdf58e6ff3480a::t_9461a1e47677b7 284-287
+  s_fdf58e6ff3480a::t_014a3e6d53b293 1-283,288-289
+crates/aenv/Cargo.toml
+  s_fdf58e6ff3480a::t_542fd3c0f6244f 32
+docs/src/concepts/templates.md
+  s_fdf58e6ff3480a::t_d47bf461f080c3 42-47,50-51,56-57,60,66-68,70-72,75-90
+  s_fdf58e6ff3480a::t_b45fea39c89a6f 114
+crates/aenv/src/commands/build/context.rs
+  s_fdf58e6ff3480a::t_8925dfa65d2100 1-41,44-53,55-123,127-191,198-347,349-558,561-723,728-781,787-848,851-1406
+  s_fdf58e6ff3480a::t_8d5cbfa30f3b26 54
+  s_fdf58e6ff3480a::t_577f46a5a174e5 192-197
+  s_fdf58e6ff3480a::t_9461a1e47677b7 42-43,124-126,348,559-560,724-727,782-786,849-850
+crates/aenv/src/client/files.rs
+  s_fdf58e6ff3480a::t_c3c65483dd7c55 166-187
+crates/aenv/src/client/snapshots.rs
+  s_fdf58e6ff3480a::t_ca8df2709f6f39 45-58,61
+  s_fdf58e6ff3480a::t_e5c9321e3930d1 99-100,104-108,111,115-137
+  s_fdf58e6ff3480a::t_d21330218fbbd7 4,6-14,16-30
+crates/aenv/src/commands/build/mod.rs
+  s_fdf58e6ff3480a::t_7c40fb8ecabe65 312-317,327,340,354
+  s_fdf58e6ff3480a::t_f6efc94f4e50a4 209,236
+  s_fdf58e6ff3480a::t_9461a1e47677b7 217-225,529-530,537-539,752-754
+  s_fdf58e6ff3480a::t_65b898d6567250 1-11,14-69,75-91,93-208,210-216,226-235,237-293,295-297,303-311,318-326,328-339,341-353,355-528,531-536,540-751,755-772,819-835
+  s_fdf58e6ff3480a::t_85563e2d7e79da 70-74
+  s_fdf58e6ff3480a::t_3e4f0f8abcc18d 773-818
+  s_fdf58e6ff3480a::t_c2ff51482d090e 12-13
+  s_fdf58e6ff3480a::t_1d37e849ed2cfa 92
+  s_fdf58e6ff3480a::t_77159c971e3392 294,298-302
+crates/aenv/src/commands/start.rs
+  s_fdf58e6ff3480a::t_71006d4962ea13 37
+crates/aenv/src/commands/build/plan.rs
+  s_fdf58e6ff3480a::t_41e229abd1c95d 1-185,187-239,241-272,287-304,306-516,521-555,559-618,621-733,737-920
+  s_fdf58e6ff3480a::t_35f27a5a5d36b5 274-278,282-286
+  s_fdf58e6ff3480a::t_3e7c22334de602 556
+  s_fdf58e6ff3480a::t_9461a1e47677b7 186,240,273,279-281,305,517-518,619-620,734
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "16fb41798d6a7778c572422e93ce2e5cb45fb574",
+  "prompts": {},
+  "sessions": {
+    "s_fdf58e6ff3480a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f55ee402-ee96-466f-b8eb-5090c1b5a8dd",
+        "model": "claude-fable-5"
+      },
+      "human_author": "JoyboyBrian <gzybrian@gmail.com>"
+    }
+  }
+}
