@@ -1,0 +1,22 @@
+services/gateway/internal/server_test.go
+  s_fdf58e6ff3480a::t_4fa176b8014fd3 2208-2295
+  s_fdf58e6ff3480a::t_574deba5057da2 1163-1168
+services/gateway/internal/server.go
+  s_fdf58e6ff3480a::t_21e51c5d74285f 730-734
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "81417157630e7712585ea6efffd693af57c96bc0",
+  "prompts": {},
+  "sessions": {
+    "s_fdf58e6ff3480a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f55ee402-ee96-466f-b8eb-5090c1b5a8dd",
+        "model": "claude-fable-5"
+      },
+      "human_author": "JoyboyBrian <gzybrian@gmail.com>"
+    }
+  }
+}
